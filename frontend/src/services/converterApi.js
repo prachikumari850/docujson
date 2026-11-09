@@ -1,3 +1,5 @@
+import { createUploadFormData } from "../utils/uploadFormData";
+
 export const API_BASE_URL = (
     import.meta.env.VITE_API_BASE_URL ??
     "http://127.0.0.1:8000"
@@ -31,7 +33,6 @@ function extractDetail(body) {
 
     return "";
 }
-
 async function readError(response) {
     try {
         const body = await response.json();
@@ -76,16 +77,7 @@ export function uploadDocument(
 ) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        const form = new FormData();
-
-        Array.from(files).forEach((file) => {
-            form.append("files", file, file.name);
-        });
-
-        form.append(
-            "roles",
-            JSON.stringify(roles)
-        );
+        const form = createUploadFormData(files, roles);
 
         xhr.open(
             "POST",

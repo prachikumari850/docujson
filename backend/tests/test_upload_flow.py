@@ -108,6 +108,47 @@ def test_multiple_files_with_explicit_roles_and_saved(client):
     assert client.get(f"/api/conversions/{conversion_id}").json()["status"] == "completed"
 
 
+def test_conversion_matches_table_answer_key_by_question_number(client):
+    paper = b"SECTION A\n1. First question\n(1) one\n(2) two\n(3) three\n(4) four\n2. Second question\n(1) one\n(2) two\n(3) three\n(4) four\n3. Third question\n(1) one\n(2) two\n(3) three\n(4) four"
+    key = b"Q. 1 2 3\nA. 3 4 1"
+    files = [("files", ("paper.txt", paper)), ("files", ("key.txt", key))]
+    roles = {"paper.txt": "question_paper", "key.txt": "answer_key"}
+    response = client.post("/api/convert", files=files, data={"roles": json.dumps(roles)})
+    assert response.status_code == 200
+    result = client.get(f"/api/conversions/{response.json()['conversion_id']}").json()["result"]
+    questions = [question for section in result["sections"] for question in section["questions"]]
+    assert [question["correct_answer"] for question in questions] == ["3", "4", "1"]
+    assert result["document"]["answer_key_provided"] is True
+    assert result["document"]["answer_key_extracted"] == 3
+    assert result["document"]["answer_key_matched"] == 3
+
+
+def test_official_50_entry_key_maps_to_numbered_question_paper(client):
+    expected = [3, 4, 1, 2, 1, 1, 4, 1, 1, 2, 2, 2, 1, 2, 3, 1, 2, 4, 1, 1, 1, 1, 1, 1, 3, 4, 2, 1, 3, 3, 4, 3, 3, 2, 1, 4, 3, 3, 3, 3, 2, 3, 2, 2, 3, 3, 1, 4, 2, 1]
+    questions = ["SECTION A"]
+    for number in range(1, 36):
+        questions.extend([f"{number}. Question {number} text", "(1) option one", "(2) option two", "(3) option three", "(4) option four"])
+    questions.append("SECTION B")
+    for number in range(36, 51):
+        questions.extend([f"{number}. Question {number} text", "(1) option one", "(2) option two", "(3) option three", "(4) option four"])
+    key_parts = []
+    for start, end in ((1, 30), (31, 50)):
+        key_parts.append("Q. " + " ".join(map(str, range(start, end + 1))))
+        key_parts.append("A. " + " ".join(map(str, expected[start - 1:end])))
+    files = [("files", ("srg.txt", "\n".join(questions).encode())), ("files", ("key.txt", "\n".join(key_parts).encode()))]
+    roles = {"srg.txt": "question_paper", "key.txt": "answer_key"}
+    response = client.post("/api/convert", files=files, data={"roles": json.dumps(roles)})
+    assert response.status_code == 200
+    result = client.get(f"/api/conversions/{response.json()['conversion_id']}").json()["result"]
+    extracted = [question for section in result["sections"] for question in section["questions"]]
+    assert len(extracted) == 50
+    assert [question["question_number"] for question in extracted] == list(range(1, 51))
+    assert [int(question["correct_answer"]) for question in extracted] == expected
+    assert [len(section["questions"]) for section in result["sections"]] == [35, 15]
+    assert result["document"]["answer_key_extracted"] == 50
+    assert result["document"]["answer_key_matched"] == 50
+
+
 def test_reject_multiple_or_missing_question_papers(client):
     pair = [("files", ("one.txt", b"one")), ("files", ("two.txt", b"two"))]
     both_papers = client.post("/api/convert", files=pair, data={"roles": json.dumps({"one.txt": "question_paper", "two.txt": "question_paper"})})

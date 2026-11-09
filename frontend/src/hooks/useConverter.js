@@ -3,6 +3,7 @@ import {
     ACCEPTED_EXTENSIONS, MAX_UPLOAD_MB, checkHealth, deleteConversion,
     downloadFile, getConversion, jsonUrl, uploadDocument, zipUrl,
 } from "../services/converterApi";
+import { addSelectedFiles, changeFileRole, removeSelectedFile, validateFileRoles } from "../utils/fileSelection";
 
 const POLL_INTERVAL_MS = 1200;
 const IN_PROGRESS = ["queued", "processing"];
@@ -15,18 +16,6 @@ function wait(milliseconds, signal) {
             reject(new DOMException("Cancelled", "AbortError"));
         }, { once: true });
     });
-}
-
-function validateFiles(files) {
-    const total = files.reduce((sum, file) => sum + file.size, 0);
-    for (const file of files) {
-        const extension = file.name.split(".").pop()?.toLowerCase();
-        if (!ACCEPTED_EXTENSIONS.includes(extension)) return `${file.name}: unsupported file type. Select PDF, DOCX, or TXT files.`;
-        if (!file.size) return `${file.name}: file is empty.`;
-    }
-    if (total > MAX_UPLOAD_MB * 1024 * 1024) return `Combined upload exceeds the ${MAX_UPLOAD_MB} MB limit.`;
-    if (files.length > 2) return "Upload one question paper and optionally one answer key.";
-    return "";
 }
 
 export function useConverter() {
@@ -45,6 +34,7 @@ export function useConverter() {
     const busyRef = useRef(false);
     const conversionIdRef = useRef(null);
     const file = files[0] ?? null;
+    const questionPaperFile = files[roles.indexOf("question_paper")] ?? file;
 
     const clearState = useCallback(() => {
         setFiles([]); setRoles([]); setPhase("idle"); setUploadProgress(0);
@@ -64,39 +54,43 @@ export function useConverter() {
 
     const selectFiles = useCallback((incoming) => {
         if (busyRef.current) return;
-        const selected = Array.from(incoming ?? []);
-        reset();
-        if (!selected.length) return;
-        const validation = validateFiles(selected);
-        if (validation) { setError(validation); return; }
-        if (new Set(selected.map((item) => item.name)).size !== selected.length) {
-            setError("Selected files must have different filenames so their roles can be identified."); return;
+        if (!Array.from(incoming ?? []).length) return;
+        const selected = addSelectedFiles(files, roles, incoming, MAX_UPLOAD_MB, ACCEPTED_EXTENSIONS);
+        setError(selected.error);
+        if (selected.error) return;
+        if (phase === "completed" || phase === "failed") {
+            const previousId = conversionIdRef.current;
+            conversionIdRef.current = null;
+            if (previousId) deleteConversion(previousId).catch(() => {});
+            setPhase("idle"); setResult(null); setConversionId(null); setProgress(0); setStage(""); setUploadProgress(0);
         }
-        setFiles(selected);
-        setRoles(selected.map((_, index) => index === 0 ? "question_paper" : "answer_key"));
-    }, [reset]);
+        setFiles(selected.files);
+        setRoles(selected.roles);
+    }, [files, roles, phase]);
 
     const setFileRole = useCallback((index, role) => {
-        setRoles((current) => current.map((value, itemIndex) => {
-            if (itemIndex === index) return role;
-            return role === "question_paper" ? "answer_key" : value;
-        }));
+        setRoles((current) => changeFileRole(current, index, role));
         setError("");
     }, []);
 
     const removeFile = useCallback((index) => {
-        setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index));
-        setRoles((current) => current.filter((_, itemIndex) => itemIndex !== index));
+        const removed = removeSelectedFile(files, roles, index);
+        setFiles(removed.files);
+        setRoles(removed.roles);
+        if (phase === "completed" || phase === "failed") {
+            const previousId = conversionIdRef.current;
+            conversionIdRef.current = null;
+            if (previousId) deleteConversion(previousId).catch(() => {});
+            setPhase("idle"); setResult(null); setConversionId(null); setProgress(0); setStage(""); setUploadProgress(0);
+        }
         setError("");
-    }, []);
+    }, [files, roles, phase]);
 
     const runConversion = useCallback(async () => {
         if (busyRef.current) return;
-        const validation = validateFiles(files);
-        if (validation) { setError(validation); return; }
-        if (roles.filter((role) => role === "question_paper").length !== 1) {
-            setError("Choose exactly one question paper before processing."); return;
-        }
+        const roleError = validateFileRoles(roles);
+        if (!files.length) { setError("Select at least one file before processing."); return; }
+        if (roleError) { setError(roleError); return; }
         const controller = new AbortController();
         controllerRef.current = controller;
         busyRef.current = true;
@@ -115,7 +109,14 @@ export function useConverter() {
                 status = await getConversion(created.conversion_id, controller.signal);
             }
             if (status.status !== "completed" || !status.result) throw new Error(status.error || "The conversion failed.");
-            setResult(status.result); setProgress(100); setPhase("completed");
+            setResult({
+                ...status.result,
+                document: {
+                    ...status.result.document,
+                    source_filename: files[roles.indexOf("question_paper")].name,
+                },
+            });
+            setProgress(100); setPhase("completed");
         } catch (caught) {
             if (controller.signal.aborted) return;
             setError(caught.message); setPhase("failed");
@@ -126,13 +127,13 @@ export function useConverter() {
 
     const download = useCallback(async (kind) => {
         if (!conversionId || downloading) return;
-        const stem = file?.name.replace(/\.[^.]+$/, "") || "docujson";
+        const stem = questionPaperFile?.name.replace(/\.[^.]+$/, "") || "docujson";
         setDownloading(kind); setDownloadError("");
         try {
             await downloadFile(kind === "zip" ? zipUrl(conversionId) : jsonUrl(conversionId), kind === "zip" ? `${stem}_with_media.zip` : `${stem}.json`);
         } catch (caught) { setDownloadError(caught.message); }
         finally { setDownloading(null); }
-    }, [conversionId, downloading, file]);
+    }, [conversionId, downloading, questionPaperFile]);
 
     useEffect(() => () => controllerRef.current?.abort(), []);
     return { file, files, roles, phase, uploadProgress, progress, stage, result, conversionId, error, downloading, downloadError, selectFiles, setFileRole, removeFile, runConversion, reset, download };

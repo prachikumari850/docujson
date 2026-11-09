@@ -153,6 +153,7 @@ async def convert(
 
     saved_files = []
     role_map = {}
+    source_name_map = {}
 
     total_size = 0
     maximum_size = settings.max_upload_mb * 1024 * 1024
@@ -209,6 +210,7 @@ async def convert(
 
             saved_files.append(destination)
             role_map[destination.name] = role
+            source_name_map[destination.name] = original_name
             logger.info("Validated upload: conversion=%s filename=%s role=%s size=%d destination=%s", conversion_id, original_name, role, destination.stat().st_size, destination)
 
             await upload.close()
@@ -219,6 +221,7 @@ async def convert(
             saved_files,
             role_map,
             root,
+            source_name_map,
         )
         logger.info("Conversion %s queued with %d files", conversion_id, len(saved_files))
 
