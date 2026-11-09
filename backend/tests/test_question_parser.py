@@ -1,4 +1,4 @@
-from app.services.engine import parse_questions, attach_media, _line_text_from_spans, _text_quality, repair_pdf_mojibake
+from app.services.engine import parse_questions, attach_media, _line_text_from_spans, _text_quality, repair_pdf_mojibake, _reconstruct_stacked_fractions, _has_encoding_artifacts, _SUPERSCRIPTS, _SUBSCRIPTS
 import fitz
 from app.services.engine import extract_pdf
 
@@ -96,6 +96,29 @@ def test_recovers_recognizable_utf8_windows1252_pdf_text():
     assert repair_pdf_mojibake("à¤¯à¤¦à¤¿") == "यदि"
     assert repair_pdf_mojibake("cosâˆ’1, Î¸, Aâ†’") == "cos−1, θ, A→"
     assert repair_pdf_mojibake("ordinary text") == "ordinary text"
+
+
+def test_mojibake_is_flagged_without_rewriting_source_text():
+    assert _has_encoding_artifacts("aâƒ— + bâƒ—")
+    assert _has_encoding_artifacts("tÂ²")
+    assert not _has_encoding_artifacts("Hindi English x² + α")
+
+
+def test_script_maps_emit_real_unicode_and_repair_multiple_verified_encoding_layers():
+    assert "2".translate(_SUPERSCRIPTS) == "\u00b2"
+    assert "2".translate(_SUBSCRIPTS) == "\u2082"
+    assert repair_pdf_mojibake("\u00c3\u00a0\u00c2\u00a4\u00c2\u00af") == "\u092f"
+
+
+def test_stacked_fraction_requires_actual_fraction_bar():
+    numerator = (10.0, 20.0, "1", fitz.Rect(20, 20, 25, 30), [])
+    denominator = (20.0, 20.0, "t", fitz.Rect(20, 40, 25, 50), [])
+    unrelated = _reconstruct_stacked_fractions([numerator, denominator])
+    assert [line[2] for line in unrelated] == ["1", "t"]
+
+    with_bar = _reconstruct_stacked_fractions([numerator, denominator], [[19.5, 34, 25.5, 34.5]])
+    assert len(with_bar) == 1
+    assert with_bar[0][2] == "1/t"
 
 
 def test_blank_graph_option_gets_a_tightly_cropped_source_asset(tmp_path):

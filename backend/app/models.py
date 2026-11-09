@@ -16,12 +16,33 @@ class BilingualText(BaseModel):
     hi: str | None = None
 
 
+class MathEvidence(BaseModel):
+    original_text: str
+    reconstructed_text: str | None = None
+    normalized_text: str | None = None
+    latex: str | None = None
+    mathml: str | None = None
+    source_page: int | None = None
+    source_bbox: list[float] | None = None
+    component_bboxes: list[list[float]] = Field(default_factory=list)
+    extraction_method: str | None = None
+    confidence: float | None = None
+    review_required: bool = True
+    review_reasons: list[str] = Field(default_factory=list)
+    vision_candidate: str | None = None
+
+
 class MediaAsset(BaseModel):
     asset_id: str
     filename: str
     type: str
     source_page: int | None = None
     bbox: list[float] | None = None
+    pixel_width: int | None = None
+    pixel_height: int | None = None
+    extraction_method: str | None = None
+    confidence: float | None = None
+    review_reasons: list[str] = Field(default_factory=list)
     content: str | None = None
 
 
@@ -32,6 +53,10 @@ class Option(BaseModel):
     media: list[MediaAsset] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
     review_required: bool = False
+    confidence: dict[str, float | None] = Field(default_factory=dict)
+    review_reasons: list[str] = Field(default_factory=list)
+    math_evidence: list[MathEvidence] = Field(default_factory=list)
+    vision_verification: dict[str, Any] | None = None
 
 
 class Question(BaseModel):
@@ -49,6 +74,8 @@ class Question(BaseModel):
     review_required: bool = False
     review_reasons: list[str] = Field(default_factory=list)
     extraction_confidence: float | None = None
+    confidence: dict[str, float | None] = Field(default_factory=dict)
+    math_evidence: list[MathEvidence] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def answer_references_known_option(self):
@@ -74,6 +101,7 @@ class DocumentInfo(BaseModel):
     answer_key_provided: bool = False
     answer_key_extracted: int = 0
     answer_key_matched: int = 0
+    vision_verification: dict[str, Any] = Field(default_factory=dict)
 
 
 class DocumentResult(BaseModel):

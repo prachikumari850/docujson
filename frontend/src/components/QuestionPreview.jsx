@@ -46,6 +46,11 @@ function OptionList({ options, correctAnswer, conversionId }) {
                         <span className="font-bold text-deep-purple">{/^\d+$/.test(String(option.id)) ? `(${option.id})` : `${option.id}.`}</span>
                         <span className="min-w-0 whitespace-pre-wrap break-words text-navy">
                             {option.text?.trim() || (!option.media?.length && <span className="italic text-amber-800">Text could not be recovered; review the source.</span>)}
+                            {option.vision_verification?.candidate_transcription && (
+                                <span className="mt-2 block rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                                    <strong>Unverified local vision candidate:</strong> {option.vision_verification.candidate_transcription}
+                                </span>
+                            )}
                             {option.media?.length > 0 && <MediaPreview media={option.media} conversionId={conversionId} />}
                         </span>
                     </li>

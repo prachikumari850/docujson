@@ -14,7 +14,8 @@ class Settings(BaseSettings):
 
     ollama_enabled: bool = False
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:3b"
+    ollama_model: str = "qwen2.5vl:3b"
+    ollama_timeout_seconds: float = 90.0
 
     tesseract_cmd: str | None = None
     tessdata_prefix: str | None = None
@@ -23,6 +24,8 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("OCR_LANGUAGES", "TESSERACT_LANG"),
     )
     ocr_dpi: int = 300
+    media_crop_margin_pt: float = 6.0
+    math_crop_dpi: int = 288
 
     cors_origins: str = "http://localhost:5173"
 

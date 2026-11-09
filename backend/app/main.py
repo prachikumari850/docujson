@@ -72,11 +72,7 @@ async def health():
                     [],
                 )
 
-                available = any(
-                    model.get("name", "").split(":")[0]
-                    == settings.ollama_model.split(":")[0]
-                    for model in models
-                )
+                available = any(model.get("name") == settings.ollama_model for model in models)
 
         except Exception:
             available = False
@@ -330,6 +326,10 @@ async def download_zip(conversion_id: str):
         debug_path = root / "extraction_debug.json"
         if debug_path.is_file():
             archive.write(debug_path, arcname="debug/extraction_debug.json")
+
+        manifest_path = root / "media_manifest.json"
+        if manifest_path.is_file():
+            archive.write(manifest_path, arcname="media/manifest.json")
 
         media_dir = root / "media"
 

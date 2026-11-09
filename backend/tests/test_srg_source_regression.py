@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import fitz
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -42,6 +43,16 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
         assert result["document"]["answer_key_matched"] == 50
         assert by_number[13]["correct_answer"] == "1"
         assert by_number[17]["correct_answer"] == "2"
+        assert "t²" in (by_number[3]["question"]["en"] or "")
+        assert "eᵗ" in (by_number[3]["question"]["en"] or "")
+        assert by_number[4]["review_required"] is True
+        assert any("mathematical" in reason.lower() for reason in by_number[4]["review_reasons"])
+        assert by_number[26]["review_required"] is False
+        assert "In the locus diagrams" in (by_number[26]["question"]["en"] or "")
+        assert "Hindi + English" not in (by_number[26]["question"]["en"] or "")
+        assert "x²" in (by_number[6]["question"]["en"] or "")
+        assert all(question.get("extraction_confidence") is None for question in questions)
+        assert all(question["confidence"].get("mathematical_reconstruction") is None for question in questions)
         assert "3a" in (by_number[13]["question"]["en"] or "")
         assert by_number[13]["options"][0]["text"].startswith("cos")
         assert "1/11" in by_number[13]["options"][0]["text"]
@@ -50,6 +61,24 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
         assert all("d2y" not in option["text"] for option in by_number[36]["options"])
         assert "d2y/dx2" in (by_number[37]["question"]["en"] or "")
         assert all(option["media"] for option in by_number[17]["options"])
+        # Legacy font/vector formula choices that native extraction misses must
+        # retain a source-cell crop, not a crop of only the printed option label.
+        for number, option_ids in ((8, {"3", "4"}), (9, {"3", "4"})):
+            for option in by_number[number]["options"]:
+                if option["id"] in option_ids:
+                    crops = [asset for asset in option["media"] if asset["type"] == "option_crop"]
+                    assert crops, f"Q{number} option {option['id']} has no source formula crop"
+                    assert fitz.Rect(crops[0]["bbox"]).width > 35
+        q24_option4 = next(option for option in by_number[24]["options"] if option["id"] == "4")
+        q24_crops = [asset for asset in q24_option4["media"] if asset["type"] == "option_crop"]
+        assert q24_crops
+        assert fitz.Rect(q24_crops[0]["bbox"]).height >= 40
+        q43 = by_number[43]
+        q43_option1 = next(option for option in q43["options"] if option["id"] == "1")
+        q43_option3 = next(option for option in q43["options"] if option["id"] == "3")
+        q43_crops = [asset for asset in q43_option1["media"] if asset["type"] == "option_crop"]
+        assert q43_crops
+        assert fitz.Rect(q43_crops[0]["bbox"]).y1 <= q43_option3["source"]["bbox"][1] - 5
         assert by_number[36]["media"] and by_number[37]["media"]
         assert all(
             not any(marker in (question.get("original_text") or "") for marker in ("Telegram", "PHASE", "NEETxNOAH"))
@@ -69,6 +98,7 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
         with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
             assert archive.testzip() is None
             archive_names = set(archive.namelist())
+            assert "media/manifest.json" in archive_names
             referenced = [
                 media["filename"]
                 for question in questions
@@ -80,6 +110,8 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
             ]
             assert all(f"media/{filename}" in archive_names for filename in referenced)
             assert "debug/extraction_debug.json" in archive_names
+            manifest = json.loads(archive.read("media/manifest.json"))
+            assert all(f"media/{asset['filename']}" in archive_names for asset in manifest["assets"])
 
         print(json.dumps({
             "pages": result["document"]["total_pages"],
