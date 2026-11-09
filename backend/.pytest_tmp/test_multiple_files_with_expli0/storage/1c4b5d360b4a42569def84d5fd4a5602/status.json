@@ -1,0 +1,23 @@
+{
+  "conversion_id": "1c4b5d360b4a42569def84d5fd4a5602",
+  "status": "completed",
+  "progress": 100,
+  "stage": "Conversion complete",
+  "error": null,
+  "result": {
+    "document": {
+      "title": "input_0",
+      "total_questions": 0,
+      "total_pages": null,
+      "source_filename": "input_0.txt",
+      "source_format": "txt",
+      "language": [
+        "en"
+      ],
+      "answer_key_matched": 0,
+      "answer_key_provided": true
+    },
+    "sections": [],
+    "extraction_warnings": []
+  }
+}

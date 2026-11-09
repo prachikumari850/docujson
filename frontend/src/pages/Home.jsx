@@ -44,15 +44,18 @@ export default function Home() {
                     <Hero />
                     <div className="mt-8">
                         <FileUploader
-                            file={converter.file}
+                            files={converter.files}
+                            roles={converter.roles}
                             phase={converter.phase}
                             uploadProgress={converter.uploadProgress}
                             progress={converter.progress}
                             stage={converter.stage}
                             error={converter.error}
                             totalQuestions={converter.result?.document?.total_questions}
-                            onSelect={converter.selectFile}
-                            onRemove={converter.reset}
+                            onSelect={converter.selectFiles}
+                            onRoleChange={converter.setFileRole}
+                            onRemove={converter.removeFile}
+                            onProcess={converter.runConversion}
                         />
                     </div>
                 </div>
