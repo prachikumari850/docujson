@@ -8,3 +8,4 @@ __pycache__/
 storage/*
 !storage/.gitkeep
 .env.example
+!backend/.env.example

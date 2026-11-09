@@ -29,11 +29,13 @@ function QuestionText({ text }) {
     );
 }
 
-function OptionList({ options, correctAnswer }) {
+function OptionList({ options, correctAnswer, conversionId }) {
     if (!options?.length) return null;
+    const visibleOptions = [...options]
+        .sort((left, right) => String(left.id).localeCompare(String(right.id), undefined, { numeric: true }));
     return (
         <ul className="mt-3 grid gap-2 sm:grid-cols-2">
-            {options.map((option, index) => {
+            {visibleOptions.map((option, index) => {
                 const correct = correctAnswer !== null && correctAnswer !== undefined && String(correctAnswer) === String(option.id);
                 return (
                     <li
@@ -41,8 +43,11 @@ function OptionList({ options, correctAnswer }) {
                         className={`flex gap-3 rounded-xl border px-3 py-2 text-sm ${correct ? "border-emerald-300 bg-emerald-50" : "border-lavender bg-white"
                             }`}
                     >
-                        <span className="font-bold text-deep-purple">{String.fromCharCode(65 + index)}.</span>
-                        <span className="whitespace-pre-wrap text-navy">{option.text}</span>
+                        <span className="font-bold text-deep-purple">{/^\d+$/.test(String(option.id)) ? `(${option.id})` : `${option.id}.`}</span>
+                        <span className="min-w-0 whitespace-pre-wrap break-words text-navy">
+                            {option.text?.trim() || (!option.media?.length && <span className="italic text-amber-800">Text could not be recovered; review the source.</span>)}
+                            {option.media?.length > 0 && <MediaPreview media={option.media} conversionId={conversionId} />}
+                        </span>
                     </li>
                 );
             })}
@@ -69,7 +74,15 @@ function QuestionCard({ question, conversionId }) {
                 )}
             </div>
             <QuestionText text={question.question} />
-            <OptionList options={question.options} correctAnswer={question.correct_answer} />
+            <OptionList options={question.options} correctAnswer={question.correct_answer} conversionId={conversionId} />
+            {question.review_required && question.review_reasons?.length > 0 && (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                    <p className="font-semibold">Review needed</p>
+                    <ul className="mt-1 list-inside list-disc">
+                        {question.review_reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}
+                    </ul>
+                </div>
+            )}
             <p className="mt-3 text-sm text-navy/70">
                 {hasAnswer ? (
                     <>

@@ -327,6 +327,10 @@ async def download_zip(conversion_id: str):
             arcname="document.json",
         )
 
+        debug_path = root / "extraction_debug.json"
+        if debug_path.is_file():
+            archive.write(debug_path, arcname="debug/extraction_debug.json")
+
         media_dir = root / "media"
 
         if media_dir.exists():
