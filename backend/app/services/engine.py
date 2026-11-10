@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import re
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
@@ -52,6 +53,7 @@ def bilingual(text: str) -> dict:
 
     english = []
     hindi = []
+    language_neutral_math = []
 
     for line in lines:
         has_hindi = bool(
@@ -74,6 +76,17 @@ def bilingual(text: str) -> dict:
             hindi.append(line)
         elif has_english:
             english.append(line)
+        elif re.search(r"[\u2200-\u22ff\u0370-\u03ff^_=+*/√∫∑∏]", line) and re.fullmatch(r"[\d\s\u2200-\u22ff\u0370-\u03ff^_=+*/√∫∑∏().,;:|\[\]{}−×÷±]+", line):
+            # Math-only layout lines (e.g. stacked integral limits) belong with
+            # the bilingual stem. Dropping them here made English/Hindi fields
+            # lose formulas that PyMuPDF correctly extracted as separate lines.
+            language_neutral_math.append(line)
+
+    if language_neutral_math:
+        if english:
+            english = language_neutral_math + english
+        if hindi:
+            hindi = language_neutral_math + hindi
 
     def reflow(lines: list[str]) -> str | None:
         paragraphs: list[str] = []
@@ -105,6 +118,14 @@ def bilingual(text: str) -> dict:
 
 def numbered_options(line: str) -> list[dict[str, str]]:
     """Read one or more labelled choices from a line that begins with an option marker."""
+    # Some embedded fonts cause the normal-sized printed (1)/(2) option label
+    # to be decoded as superscript glyphs. Normalize only at the start of a
+    # candidate line; superscripts inside the formula remain untouched.
+    line = re.sub(
+        r"^\s*⁽([¹²³⁴])⁾",
+        lambda match: "(" + match.group(1).translate(str.maketrans("¹²³⁴", "1234")) + ")",
+        line,
+    )
     leading = len(line) - len(line.lstrip())
     candidates = list(OPTION_RE.finditer(line))
     if not candidates or candidates[0].start() != leading:
@@ -168,6 +189,36 @@ def clean_marks(text: str):
     ).strip()
 
     return cleaned, float(value)
+
+
+def _spatial_reflow_fragments(fragments: list[dict]) -> str:
+    """Reorder expression parts by x within geometric rows, not parser arrival order."""
+    usable = []
+    for fragment in fragments:
+        text = str(fragment.get("text", "")).strip()
+        bbox = fragment.get("bbox")
+        if text and bbox and len(bbox) == 4:
+            usable.append((fitz.Rect(bbox), text))
+    if not usable:
+        return ""
+    usable.sort(key=lambda item: (item[0].y0, item[0].x0))
+    rows: list[list[tuple[fitz.Rect, str]]] = []
+    for item in usable:
+        rect, _ = item
+        candidates = [
+            row for row in rows
+            if min(row[-1][0].y1, rect.y1) - max(row[-1][0].y0, rect.y0) > 0
+            or abs(row[-1][0].y0 - rect.y0) <= 5.5
+        ]
+        if candidates:
+            row = min(candidates, key=lambda candidate: abs(candidate[0][0].y0 - rect.y0))
+            row.append(item)
+        else:
+            rows.append([item])
+    return "\n".join(
+        " ".join(text for _, text in sorted(row, key=lambda item: item[0].x0))
+        for row in rows
+    ).strip()
 
 
 def image_bytes(data: bytes):
@@ -272,6 +323,34 @@ def _has_displaced_short_option_content(option: dict) -> bool:
     return False
 
 
+def _has_suspicious_math_layout(text: str) -> bool:
+    """Identify visibly fragmented short formula rows without rewriting them."""
+    if any(mark in text for mark in ("₍", "₎", "\ufffd")):
+        return True
+    rows = [row.strip() for row in text.splitlines() if row.strip()]
+    if len(rows) > 1 and any(
+        len(row) <= 2 and re.search(r"[0-9πθ√∫∑∏=+−\-*/()\[\]{}]", row)
+        for row in rows
+    ):
+        return True
+    if any(token in text for token in ("cos−¹", "sin−¹", "tan−¹", "cos-¹", "sin-¹", "tan-¹")):
+        if text.count("(") != text.count(")"):
+            return True
+    rows = [row.strip() for row in text.splitlines() if row.strip()]
+    unit_axes = re.findall(r"(?<![A-Za-z])[ijk]\u0302", text)
+    if any(re.fullmatch(r"[ijk]\u0302", row) for row in rows):
+        return True
+    if len(rows) > 1 and any(
+        sum(len(re.findall(rf"(?<![A-Za-z]){axis}\u0302", row)) for row in rows) > 1
+        for axis in "ijk"
+    ):
+        return True
+    coefficient_count = len(re.findall(r"(?:\d+\s*/\s*\d+|\b\d+\b)", text))
+    if coefficient_count >= 3 and len(unit_axes) < 3 and unit_axes:
+        return True
+    return False
+
+
 def _ocr_page(page, page_number: int | None = None, media_dir: Path | None = None):
     """OCR only a page already judged weak; retain the 300-DPI render as diagnostic evidence."""
     warnings = []
@@ -358,10 +437,32 @@ def _ocr_page(page, page_number: int | None = None, media_dir: Path | None = Non
 def _line_text_from_spans(spans: list[dict]) -> str:
     """Join decoded span text in geometric order without deleting math or Unicode glyphs."""
     ordered = sorted(spans, key=lambda span: (span.get("bbox", [0, 0])[0], span.get("bbox", [0, 0])[1]))
+    character_records = [
+        (span, char)
+        for span in ordered
+        for char in span.get("chars", [])
+        if char.get("c", "").strip() and len(char.get("origin", [])) > 1
+    ]
+    span_sizes = [float(span.get("size", 0) or 0) for span, _ in character_records if float(span.get("size", 0) or 0) > 0]
+    reference_size = sorted(span_sizes)[len(span_sizes) // 2] if span_sizes else 0
+    baseline_records = [
+        char.get("origin", [0, 0])[1]
+        for span, char in character_records
+        if reference_size == 0 or float(span.get("size", 0) or 0) >= reference_size * 0.84
+    ]
+    reference_baseline = sorted(baseline_records)[len(baseline_records) // 2] if baseline_records else None
+    reference_heights = [
+        fitz.Rect(char.get("bbox", span.get("bbox", [0, 0, 0, 0]))).height
+        for span, char in character_records
+        if reference_size == 0 or float(span.get("size", 0) or 0) >= reference_size * 0.84
+    ]
+    reference_height = sorted(reference_heights)[len(reference_heights) // 2] if reference_heights else None
     pieces: list[str] = []
+    rendered_span_values = {}
     previous = None
     for span in ordered:
-        value = repair_pdf_mojibake(_render_span_scripts(span))
+        value = repair_pdf_mojibake(_render_span_scripts(span, reference_baseline, reference_height))
+        rendered_span_values[id(span)] = value
         if not value:
             continue
         if previous is not None and pieces:
@@ -373,32 +474,210 @@ def _line_text_from_spans(spans: list[dict]) -> str:
         previous = span
     joined = "".join(pieces).strip()
     joined = re.sub(r"([A-Za-z0-9])\s+([\u2070-\u209f\u1d2c-\u1d7f])", r"\1\2", joined)
-    # In this paper's native text layer, Type3 vector-arrow glyphs are emitted
-    # as a neighboring arrow character. Preserve them as a combining vector mark.
-    joined = re.sub(r"(?:\u2192\s*([abcijkABC])|([abcijkABC])\s*\u2192)", lambda match: (match.group(1) or match.group(2)) + "\u20d7", joined)
-    return joined
+    # Arrow text is not sufficient evidence of vector notation: e.g. ``A → B``
+    # is a relation, while a separately drawn arrow above A is a vector mark.
+    # Only combine an arrow glyph when its character box geometrically overlaps
+    # a single letter and sits above that letter. Otherwise preserve the arrow.
+    arrow_chars = []
+    base_chars = []
+    for span in ordered:
+        for char in span.get("chars", []):
+            value = char.get("c", "")
+            if value in ("\u2192", "\u20d7"):
+                arrow_chars.append((span, char, fitz.Rect(char.get("bbox", span.get("bbox", (0, 0, 0, 0))))))
+            elif value.strip() and len(value.strip()) == 1 and value.strip().isalpha():
+                base_chars.append((span, char, fitz.Rect(char.get("bbox", span.get("bbox", (0, 0, 0, 0))))))
+
+    insertions: dict[int, list[tuple[int, str]]] = {}
+    removed_arrows = set()
+    for arrow_span, arrow_char, arrow_rect in arrow_chars:
+        candidates = []
+        for base_span, base_char, base_rect in base_chars:
+            if base_char is arrow_char:
+                continue
+            overlap = min(arrow_rect.x1, base_rect.x1) - max(arrow_rect.x0, base_rect.x0)
+            if overlap <= 0 or arrow_rect.y1 > base_rect.y0 + 1.0:
+                continue
+            if base_rect.height <= 0 or overlap / base_rect.width < 0.35:
+                continue
+            candidates.append((abs((arrow_rect.x0 + arrow_rect.x1 - base_rect.x0 - base_rect.x1) / 2), base_span, base_char))
+        if not candidates:
+            continue
+        _, base_span, base_char = min(candidates, key=lambda candidate: candidate[0])
+        offset = _character_text_offset([base_span], base_char)
+        if offset < 0:
+            continue
+        insertions.setdefault(id(base_span), []).append((offset + len(base_char.get("c", "")), "\u20d7"))
+        removed_arrows.add((id(arrow_span), id(arrow_char)))
+
+    if not insertions and not removed_arrows:
+        return joined
+
+    pieces = []
+    previous = None
+    for span in ordered:
+        value = rendered_span_values.get(id(span), repair_pdf_mojibake(_render_span_scripts(span, reference_baseline, reference_height)))
+        if not value:
+            continue
+        chars = span.get("chars", [])
+        arrow_values = {
+            char.get("c", "") for char in chars
+            if (id(span), id(char)) in removed_arrows
+        }
+        if arrow_values:
+            for arrow in arrow_values:
+                value = value.replace(arrow, "", 1)
+        offsets = insertions.get(id(span), [])
+        for offset, mark in sorted(offsets, reverse=True):
+            value = value[:offset] + mark + value[offset:]
+        if not value:
+            continue
+        if previous is not None and pieces:
+            gap = float(span.get("bbox", [0])[0]) - float(previous.get("bbox", [0, 0, 0, 0])[2])
+            size = max(float(span.get("size", 0) or 0), float(previous.get("size", 0) or 0))
+            if gap > max(1.5, size * 0.18) and not pieces[-1].endswith((" ", "\t")) and not value.startswith((" ", "\t")):
+                pieces.append(" ")
+        pieces.append(value)
+        previous = span
+    return re.sub(r"([A-Za-z0-9])\s+([\u2070-\u209f\u1d2c-\u1d7f])", r"\1\2", "".join(pieces).strip())
 
 
-def _render_span_scripts(span: dict) -> str:
+def _ordered_layout_lines(lines, page_width: float):
+    """Order full-width separators and independent columns without a page-wide y sort."""
+    if not lines:
+        return [], None
+
+    def order_rows(items):
+        # Keep native visual order based on the span rectangle. The separate
+        # baseline value is used by the parser for ownership only; sorting the
+        # rendered page by baselines reorders stacked bilingual option cells.
+        return sorted(items, key=lambda item: (item[3].y0, item[3].x0))
+
+    full, left, right = [], [], []
+    for item in lines:
+        rect = item[3]
+        if rect.width >= page_width * 0.68 or (rect.x0 < page_width * 0.12 and rect.x1 > page_width * 0.88):
+            full.append(item)
+        elif (rect.x0 + rect.x1) / 2 < page_width / 2:
+            left.append(item)
+        else:
+            right.append(item)
+    full = order_rows(full)
+    left = order_rows(left)
+    right = order_rows(right)
+    if not left or not right:
+        ordered = order_rows(lines)
+        return ordered, None
+
+    # A full-width heading/paragraph separates reading-order bands. Within each
+    # band, read down the left column and then down the right column.
+    ordered = []
+    previous_y = float("-inf")
+    for separator in full:
+        separator_y = separator[3].y0
+        ordered.extend(item for item in left if previous_y < item[3].y0 < separator_y)
+        ordered.extend(item for item in right if previous_y < item[3].y0 < separator_y)
+        ordered.append(separator)
+        previous_y = separator_y
+    ordered.extend(item for item in left if item[3].y0 > previous_y)
+    ordered.extend(item for item in right if item[3].y0 > previous_y)
+    bounds = {
+        "left": [min(item[3].x0 for item in left), max(item[3].x1 for item in left)],
+        "right": [min(item[3].x0 for item in right), max(item[3].x1 for item in right)],
+    }
+    return ordered, bounds
+
+
+def _cluster_drawing_rectangles(drawings, page_rect: fitz.Rect) -> list[fitz.Rect]:
+    """Group adjacent PDF vector primitives into diagram regions before filtering."""
+    rects = []
+    for drawing in drawings:
+        try:
+            rect = fitz.Rect(drawing["rect"]) & page_rect
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rect.is_empty or rect.width < 0.8 and rect.height < 0.8:
+            continue
+        rects.append(rect)
+    if not rects:
+        return []
+
+    parent = list(range(len(rects)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left_index, right_index):
+        left_root, right_root = find(left_index), find(right_index)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    # Small vector pieces commonly form one graph or diagram. Join only close
+    # geometry, and reject unions that would swallow a substantial page region.
+    max_union_area = page_rect.get_area() * 0.32
+    for left_index, left_rect in enumerate(rects):
+        for right_index in range(left_index + 1, len(rects)):
+            right_rect = rects[right_index]
+            x_gap = max(left_rect.x0 - right_rect.x1, right_rect.x0 - left_rect.x1, 0)
+            y_gap = max(left_rect.y0 - right_rect.y1, right_rect.y0 - left_rect.y1, 0)
+            if x_gap > 9 or y_gap > 9:
+                continue
+            if (left_rect | right_rect).get_area() <= max_union_area:
+                union(left_index, right_index)
+
+    groups: dict[int, fitz.Rect] = {}
+    for index, rect in enumerate(rects):
+        root = find(index)
+        groups[root] = rect if root not in groups else groups[root] | rect
+
+    regions = []
+    page_area = max(1, page_rect.get_area())
+    for rect in groups.values():
+        if rect.width < 45 or rect.height < 35:
+            continue
+        if rect.y0 < page_rect.height * 0.10 or rect.y1 > page_rect.height * 0.94:
+            continue
+        if rect.get_area() < page_area * 0.0015 or rect.get_area() > page_area * 0.24:
+            continue
+        if rect.width > page_rect.width * 0.82 or rect.height > page_rect.height * 0.62:
+            continue
+        if rect.width / max(rect.height, 1) > 7.5 or rect.height / max(rect.width, 1) > 7.5:
+            continue
+        regions.append(rect)
+    return sorted(regions, key=lambda rect: (rect.y0, rect.x0))
+
+
+def _layout_column(bbox, page_width: float) -> str:
+    rect = fitz.Rect(bbox)
+    if rect.width >= page_width * 0.68:
+        return "full"
+    return "left" if (rect.x0 + rect.x1) / 2 < page_width / 2 else "right"
+
+
+def _render_span_scripts(span: dict, reference_baseline: float | None = None, reference_height: float | None = None) -> str:
     chars = span.get("chars", [])
-    if len(chars) < 2:
+    if not chars:
         return span.get("text", "")
     valid_origins = [char.get("origin", [0, 0])[1] for char in chars if char.get("c", "").strip() and len(char.get("origin", [])) > 1]
-    if not valid_origins:
+    if reference_baseline is None and not valid_origins:
         return span.get("text", "")
-    baseline = sorted(valid_origins)[len(valid_origins) // 2]
+    baseline = reference_baseline if reference_baseline is not None else sorted(valid_origins)[len(valid_origins) // 2]
+    heights = [fitz.Rect(item.get("bbox", span.get("bbox", [0, 0, 0, 0]))).height for item in chars if item.get("c", "").strip()]
+    span_height = reference_height or (sorted(heights)[len(heights) // 2] if heights else fitz.Rect(span.get("bbox", [0, 0, 0, 0])).height)
     output = []
     for char in chars:
         value = char.get("c", "")
         origin = char.get("origin", [0, baseline])
         delta = baseline - origin[1] if len(origin) > 1 else 0
         bbox = fitz.Rect(char.get("bbox", span.get("bbox", [0, 0, 0, 0])))
-        median_height = sorted(fitz.Rect(item.get("bbox", [0, 0, 0, 0])).height for item in chars if item.get("c", "").strip())[len(valid_origins) // 2]
-        if delta >= max(1.6, bbox.height * 0.12) or ((value.strip().isdigit() or value == "/") and bbox.height <= median_height * 0.82):
+        if delta >= max(1.6, span_height * 0.12):
             value = value.translate(_SUPERSCRIPTS)
             if value == "/":
                 value = "\u2044"
-        elif delta <= -max(1.6, bbox.height * 0.12):
+        elif delta <= -max(1.6, span_height * 0.12):
             value = value.translate(_SUBSCRIPTS)
         output.append(value)
     return "".join(output)
@@ -492,6 +771,92 @@ def _character_text_offset(spans, wanted):
     return -1
 
 
+def _associate_detached_vector_marks(lines):
+    """Join detached over-arrow/hat glyph lines to a base only on glyph overlap.
+
+    Type3 fonts in the SRG source encode vector arrows and unit-vector hats as
+    separate text objects. Their bounding boxes overlap the variable glyph
+    above it, but the PDF line extractor places each mark on its own line.
+    Keep all span evidence and record every geometry-based association.
+    """
+    marks = []
+    bases = []
+    for line_index, line in enumerate(lines):
+        mark_text = line[2].strip()
+        if mark_text not in {"→", "ˆ", "^", "̂", "⌃"}:
+            continue
+        mark_chars = [
+            char
+            for span in line[4]
+            for char in span.get("chars", [])
+            if char.get("c", "").strip() in {"→", "ˆ", "^", "̂", "⌃"}
+        ]
+        if not mark_chars:
+            continue
+        marks.append((line_index, mark_text, fitz.Rect(mark_chars[0].get("bbox", line[3])), mark_chars[0]))
+
+    for line_index, line in enumerate(lines):
+        for span in line[4]:
+            for char in span.get("chars", []):
+                value = char.get("c", "").strip()
+                if len(value) == 1 and value.isalpha():
+                    bases.append((line_index, value, fitz.Rect(char.get("bbox", span.get("bbox", line[3]))), char))
+
+    consumed = set()
+    claimed_bases = set()
+    associations = []
+    updated = list(lines)
+    insertions: dict[int, list[tuple[int, str]]] = {}
+    mark_rects: dict[int, fitz.Rect] = {}
+    for mark_index, mark_text, mark_rect, mark_char in marks:
+        candidates = []
+        for base_index, base_char_value, base_rect, base_char in bases:
+            if base_index == mark_index or (base_index, id(base_char)) in claimed_bases:
+                continue
+            overlap_x = min(mark_rect.x1, base_rect.x1) - max(mark_rect.x0, base_rect.x0)
+            if overlap_x <= 0 or overlap_x / max(0.1, base_rect.width) < 0.45:
+                continue
+            horizontal_centres = abs((mark_rect.x0 + mark_rect.x1 - base_rect.x0 - base_rect.x1) / 2)
+            if horizontal_centres > max(2.5, base_rect.width * 0.55):
+                continue
+            vertical_centres = (base_rect.y0 + base_rect.y1 - mark_rect.y0 - mark_rect.y1) / 2
+            if not 1.0 <= vertical_centres <= max(15.0, base_rect.height * 0.95):
+                continue
+            candidates.append((horizontal_centres + vertical_centres * 0.12, base_index, base_char_value, base_rect, base_char))
+        if not candidates:
+            continue
+        _, base_index, base_value, base_rect, base_char = min(candidates, key=lambda item: item[0])
+        mark = "\u20d7" if mark_text == "→" else "\u0302"
+        target = lines[base_index]
+        offset = _character_text_offset(target[4], base_char)
+        if offset < 0:
+            continue
+        insertion = offset + len(base_char.get("c", ""))
+        insertions.setdefault(base_index, []).append((insertion, mark))
+        mark_rects[base_index] = mark_rect if base_index not in mark_rects else mark_rects[base_index] | mark_rect
+        consumed.add(mark_index)
+        claimed_bases.add((base_index, id(base_char)))
+        associations.append({
+            "mark": mark_text,
+            "normalized_mark": mark,
+            "base_character": base_value,
+            "mark_bbox": list(mark_rect),
+            "base_bbox": list(base_rect),
+            "source_line_index": mark_index,
+            "target_line_index": base_index,
+            "method": "character_bbox_overlap_and_vertical_offset",
+        })
+    for line_index, line_insertions in insertions.items():
+        source = lines[line_index]
+        text = source[2]
+        for insertion, mark in sorted(line_insertions, reverse=True):
+            text = text[:insertion] + mark + text[insertion:]
+        # Keep the original line box stable; the over-arrow evidence remains
+        # separately recorded and must not shift line reading order or owners.
+        updated[line_index] = (source[0], source[1], text, source[3], source[4])
+    return [line for index, line in enumerate(updated) if index not in consumed], associations
+
+
 def repair_pdf_mojibake(text: str) -> str:
     """Repair verifiable UTF-8-as-Windows-1252 layers; preserve originals elsewhere."""
     marker_pattern = "(?:" + re.escape(chr(0xC3)) + ".|" + re.escape(chr(0xC2)) + ".|" + re.escape(chr(0xE2)) + ".|" + re.escape(chr(0xE0) + chr(0xA4)) + "|" + re.escape(chr(0xE0) + chr(0xA5)) + "|" + re.escape(chr(0xCE)) + ".|" + re.escape(chr(0xCF)) + ".)"
@@ -520,7 +885,8 @@ def _reconstruct_stacked_fractions(lines, fraction_rules=()):
             continue
         y, x, text, bbox, spans = line
         token = text.strip()
-        if not re.fullmatch(r"[A-Za-z0-9\u0370-\u03ff]+", token) or not re.search(r"\d", token):
+        math_letters = r"A-Za-z0-9\u00b9\u00b2\u00b3\u0370-\u03ff\u2070-\u209f\u1d2c-\u1d7f\u221a\u221b"
+        if not re.fullmatch(f"[{math_letters}]+", token) or not re.search(r"\d|[\u2070-\u2079\u00b9\u00b2\u00b3]", token):
             reconstructed.append(line)
             continue
         candidates = []
@@ -532,13 +898,30 @@ def _reconstruct_stacked_fractions(lines, fraction_rules=()):
             if gap > 28:
                 break
             denominator = next_text.strip()
-            if not re.fullmatch(r"[A-Za-z0-9\u0370-\u03ff]+", denominator):
+            if not re.fullmatch(f"[{math_letters}]+", denominator):
                 continue
             x_overlap = min(bbox.x1, next_bbox.x1) - max(bbox.x0, next_bbox.x0)
             if x_overlap >= 0 and abs((bbox.x0 + bbox.x1) / 2 - (next_bbox.x0 + next_bbox.x1) / 2) <= 9 and 4 <= gap <= 28:
                 for rule_values in fraction_rules:
                     rule = fitz.Rect(rule_values)
-                    if rule.width >= 4 and rule.height <= 1.5 and rule.y0 >= bbox.y1 - 2 and rule.y1 <= next_bbox.y0 + 2 and rule.x0 <= bbox.x1 + 1 and rule.x1 >= bbox.x0 - 1:
+                    overlap_num = min(rule.x1, bbox.x1) - max(rule.x0, bbox.x0)
+                    overlap_den = min(rule.x1, next_bbox.x1) - max(rule.x0, next_bbox.x0)
+                    if not (
+                        rule.width >= 4
+                        and rule.height <= 1.5
+                        and rule.y0 >= bbox.y1 - 2
+                        and rule.y1 <= next_bbox.y0 + 2
+                        and overlap_num >= min(3.0, bbox.width * 0.7)
+                        and overlap_den >= min(3.0, next_bbox.width * 0.7)
+                    ):
+                        continue
+                    intervening = any(
+                        between_index not in consumed
+                        and bbox.y1 <= lines[between_index][3].y0 < next_bbox.y0
+                        and min(rule.x1, lines[between_index][3].x1) > max(rule.x0, lines[between_index][3].x0)
+                        for between_index in range(index + 1, next_index)
+                    )
+                    if not intervening:
                         candidates.append((gap, next_index, denominator, next_bbox, next_spans))
                         break
         if not candidates:
@@ -595,7 +978,6 @@ def extract_pdf(path: Path, media_dir: Path):
                         continue
 
                     bbox = fitz.Rect(line["bbox"])
-
                     text_lines.append(
                         (
                             bbox.y0,
@@ -606,20 +988,15 @@ def extract_pdf(path: Path, media_dir: Path):
                         )
                     )
 
-            text_lines.sort(key=lambda item: (item[0], item[1]))
             page_width = page.rect.width
-            left_lines, right_lines, full_lines = [], [], []
-            for item in text_lines:
-                rect = item[3]
-                if rect.width >= page_width * 0.68 or (rect.x0 < page_width * 0.12 and rect.x1 > page_width * 0.88):
-                    full_lines.append(item)
-                elif rect.x0 + rect.width / 2 < page_width / 2:
-                    left_lines.append(item)
-                else:
-                    right_lines.append(item)
-            # Preserve full-width headings first, then read each column top-to-bottom.
-            ordered_lines = sorted(full_lines, key=lambda item: (item[0], item[1])) + sorted(left_lines, key=lambda item: (item[0], item[1])) + sorted(right_lines, key=lambda item: (item[0], item[1]))
+            ordered_lines, column_bounds = _ordered_layout_lines(text_lines, page_width)
             native_ordered_lines = list(ordered_lines)
+            column_texts = None
+            if column_bounds:
+                column_texts = [
+                    [item[2] for item in text_lines if (item[3].x0 + item[3].x1) / 2 < page_width / 2 and item[3].width < page_width * 0.68],
+                    [item[2] for item in text_lines if (item[3].x0 + item[3].x1) / 2 >= page_width / 2 and item[3].width < page_width * 0.68],
+                ]
             fraction_rules = [list(drawing["rect"]) for drawing in drawings if fitz.Rect(drawing["rect"]).height <= 1.5 and fitz.Rect(drawing["rect"]).width >= 4]
             ordered_lines = _reconstruct_stacked_fractions(ordered_lines, fraction_rules)
             ordered_lines = _attach_detached_scripts(ordered_lines)
@@ -652,19 +1029,19 @@ def extract_pdf(path: Path, media_dir: Path):
             if needs_ocr:
                 ocr_text, ocr_warnings, ocr_lines = _ocr_page(page, page_number, media_dir)
                 if ocr_text.strip() and _text_quality(original_text) < 0.55 and _text_quality(ocr_text) > _text_quality(original_text) + 0.08:
-                    full_ocr, left_ocr, right_ocr = [], [], []
-                    for ocr_line in ocr_lines:
-                        rect = ocr_line[3]
-                        if rect.width >= page_width * 0.68:
-                            full_ocr.append(ocr_line)
-                        elif (rect.x0 + rect.x1) / 2 < page_width / 2:
-                            left_ocr.append(ocr_line)
-                        else:
-                            right_ocr.append(ocr_line)
-                    ordered_lines = sorted(full_ocr, key=lambda item: (item[0], item[1])) + sorted(left_ocr, key=lambda item: (item[0], item[1])) + sorted(right_ocr, key=lambda item: (item[0], item[1]))
+                    ordered_lines, column_bounds = _ordered_layout_lines(ocr_lines, page_width)
+                    column_texts = None
+                    if column_bounds:
+                        column_texts = [
+                            [item[2] for item in ocr_lines if (item[3].x0 + item[3].x1) / 2 < page_width / 2 and item[3].width < page_width * 0.68],
+                            [item[2] for item in ocr_lines if (item[3].x0 + item[3].x1) / 2 >= page_width / 2 and item[3].width < page_width * 0.68],
+                        ]
                     page_text = "\n".join(item[2] for item in ordered_lines)
                     ocr_used = bool(page_text)
                     ocr_warnings.append("OCR text replaced native page text because native extraction quality was poor; both versions remain in debug data.")
+
+            ordered_lines, vector_mark_associations = _associate_detached_vector_marks(ordered_lines)
+            page_text = "\n".join(item[2] for item in ordered_lines)
 
             pages.append(
                 {
@@ -679,15 +1056,14 @@ def extract_pdf(path: Path, media_dir: Path):
                     "ocr_warnings": ocr_warnings,
                     "needs_review": needs_ocr,
                     "lines": ordered_lines,
+                    "vector_mark_associations": vector_mark_associations,
                     "native_lines": native_ordered_lines,
                     "ocr_lines": ocr_lines,
                     "spans": [span for _, _, _, _, spans in native_ordered_lines for span in spans],
                     "span_lines": [{"bbox": list(bbox), "text": text, "spans": spans} for _, _, text, bbox, spans in native_ordered_lines],
                     "fonts": [list(font) for font in page.get_fonts(full=True)],
-                    "columns": [
-                        [item[2] for item in sorted(left_lines, key=lambda item: (item[0], item[1]))],
-                        [item[2] for item in sorted(right_lines, key=lambda item: (item[0], item[1]))],
-                    ] if left_lines and right_lines else None,
+                    "columns": column_texts,
+                    "column_bounds": column_bounds,
                     "words": [word for word in page.get_text("words")],
                     "fraction_rules": fraction_rules,
                     "needs_ocr": needs_ocr,
@@ -757,51 +1133,7 @@ def extract_pdf(path: Path, media_dir: Path):
                     media.append(asset)
                     media_hashes[digest] = asset["asset_id"]
 
-            drawing_regions = []
-
-            for drawing in drawings:
-                rect = fitz.Rect(drawing["rect"])
-
-                if rect.width < 45 or rect.height < 35:
-                    continue
-
-                if rect.y0 < page.rect.height * 0.10:
-                    continue
-
-                if rect.y1 > page.rect.height * 0.94:
-                    continue
-
-                if (
-                    rect.width * rect.height
-                    < page.rect.width
-                    * page.rect.height
-                    * 0.0015
-                ):
-                    continue
-
-                if rect.width * rect.height > page.rect.width * page.rect.height * 0.24:
-                    continue
-
-                if rect.width > page.rect.width * 0.82 and rect.height > page.rect.height * 0.62:
-                    continue
-
-                if rect.width / max(rect.height, 1) > 7.5 or rect.height / max(rect.width, 1) > 7.5:
-                    continue
-
-                duplicate = any(
-                    rect.intersects(existing)
-                    and (
-                        rect | existing
-                    ).get_area()
-                    < (
-                        rect.get_area()
-                        + existing.get_area()
-                    ) * 1.35
-                    for existing in drawing_regions
-                )
-
-                if not duplicate:
-                    drawing_regions.append(rect)
+            drawing_regions = _cluster_drawing_rectangles(drawings, page.rect)
 
             for index, rect in enumerate(
                 drawing_regions,
@@ -989,7 +1321,35 @@ def parse_questions(pages: list[dict]):
         if question is None:
             return
 
+        pending_numerators = question.pop("_pending_fraction_numerators", {})
+        for option_id, fragments in pending_numerators.items():
+            target = next((item for item in question["options"] if item["id"] == option_id), None)
+            if target is None:
+                continue
+            for fragment, bbox in fragments:
+                target.setdefault("_fragments", []).append({"text": fragment, "bbox": list(bbox)})
+            if fragments:
+                reason = "A stacked mathematical fragment had no geometrically supported denominator."
+                target["review_required"] = True
+                target["review_reasons"] = list(dict.fromkeys(target.get("review_reasons", []) + [reason]))
+                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [f"Option {option_id}: {reason}"]))
+
         question["options"].sort(key=lambda option: (not str(option["id"]).isdigit(), int(option["id"]) if str(option["id"]).isdigit() else str(option["id"])))
+        for option in question["options"]:
+            fragments = option.pop("_fragments", [])
+            if fragments:
+                option["original_text"] = option.get("original_text", option.get("text", ""))
+                reflowed = _spatial_reflow_fragments(fragments)
+                if reflowed:
+                    option["text"] = reflowed
+            # A role may have been initialized while the option was empty and
+            # filled later from a superscript/fraction fragment. Recompute that
+            # state from the final text and actual reasons instead of retaining
+            # a stale blank-option flag.
+            if option.get("text", "").strip() and not option.get("review_reasons"):
+                option["review_required"] = bool(option.get("media"))
+
+        question["source"]["regions"] = question.pop("_regions", [])
 
         raw_text = "\n".join(
             question.pop("_lines")
@@ -1008,6 +1368,8 @@ def parse_questions(pages: list[dict]):
         question["question"] = bilingual(raw_text)
         question["original_text"] = raw_text
         question["reconstructed_text"] = question["question"]
+        devanagari_count = len(re.findall(r"[\u0900-\u097f]", raw_text))
+        question["_source_language"] = "hi" if devanagari_count >= 4 and question["question"].get("hi") else "en"
 
         question["marks"] = marks
 
@@ -1017,8 +1379,13 @@ def parse_questions(pages: list[dict]):
         reasons = list(question.get("review_reasons", []))
         if not raw_text:
             reasons.append("Question text could not be extracted.")
-        if is_mcq and len(option_ids) != 4:
-            reasons.append(f"Expected four choices but recovered {len(option_ids)} distinct option labels.")
+        option_labels = [str(option["id"]) for option in question["options"]]
+        numeric_labels = sorted({int(label) for label in option_labels if label.isdigit()})
+        alpha_labels = sorted({label.upper() for label in option_labels if len(label) == 1 and label.upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+        if len(numeric_labels) == len(option_labels) and numeric_labels and numeric_labels != list(range(numeric_labels[0], numeric_labels[-1] + 1)):
+            reasons.append("Option numbering has a gap or duplicate; inspect the source option region.")
+        if len(alpha_labels) == len(option_labels) and alpha_labels and alpha_labels != list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[ord(alpha_labels[0]) - ord("A"):ord(alpha_labels[-1]) - ord("A") + 1]):
+            reasons.append("Option lettering has a gap or duplicate; inspect the source option region.")
         if any(not option["text"].strip() and not option.get("media") for option in question["options"]):
             reasons.append("One or more options have neither readable text nor associated media.")
         if any(
@@ -1062,7 +1429,7 @@ def parse_questions(pages: list[dict]):
         }
         for option in question["options"]:
             option_text = option.get("text", "")
-            option_math_suspicious = bool("\ufffd" in option_text or re.search(r"(?:\d\s+\d\s*/\s*\d|\d/\d\s+\d/\d|(?:^|\s)[=+*/]\s{2,}|[A-Za-z)]\d(?:/|\b)|[=+\-−]\s*$)", option_text))
+            option_math_suspicious = bool(_has_suspicious_math_layout(option_text) or re.search(r"(?:\d\s+\d\s*/\s*\d|\d/\d\s+\d/\d|(?:^|\s)[=+*/]\s{2,}|[A-Za-z)]\d(?:/|\b)|[=+\-−]\s*$)", option_text))
             option["confidence"] = {
                 "text_recognition": None,
                 "mathematical_reconstruction": None,
@@ -1077,12 +1444,26 @@ def parse_questions(pages: list[dict]):
         number = int(question["question_number"])
         question.pop("_option_started", None)
         question.pop("_option_anchors", None)
+        question.pop("_option_anchor_pages", None)
         question.pop("_page_needs_review", None)
         existing = questions_by_number.get(number)
         if existing is None:
+            question["source"]["language"] = question.pop("_source_language", "unknown")
             questions_by_number[number] = question
             current_section["questions"].append(question)
         else:
+            prior_language = existing.get("source", {}).get("language", "unknown")
+            incoming_language = question.pop("_source_language", "unknown")
+            if prior_language == "unknown" or incoming_language == "en":
+                existing.setdefault("source", {})["language"] = incoming_language
+            prior_regions = existing.setdefault("source", {}).setdefault("regions", [])
+            for region in question.get("source", {}).get("regions", []):
+                if region not in prior_regions:
+                    prior_regions.append(region)
+            prior_content = existing.setdefault("source", {}).setdefault("content_bboxes", [])
+            for region in question.get("source", {}).get("content_bboxes", []):
+                if region not in prior_content:
+                    prior_content.append(region)
             for language in ("en", "hi"):
                 first = existing["question"].get(language)
                 second = question["question"].get(language)
@@ -1099,10 +1480,21 @@ def parse_questions(pages: list[dict]):
                 if prior is None:
                     existing["options"].append(option)
                 elif prior["text"] != option["text"]:
-                    prior_hindi = bool(re.search(r"[\u0900-\u097f]", prior["text"]))
-                    option_hindi = bool(re.search(r"[\u0900-\u097f]", option["text"]))
-                    if re.search(r"[A-Za-z]", option["text"]) and not option_hindi and prior_hindi:
+                    prior.setdefault("source", {}).setdefault("alternate_texts", []).append({
+                        "text": option["text"],
+                        "source": option.get("source", {}),
+                        "language": incoming_language,
+                    })
+                    if prior_language == "hi" and incoming_language == "en" and option["text"].strip():
                         prior["text"] = option["text"]
+                        prior["original_text"] = option.get("original_text", option["text"])
+                        prior["source"] = option.get("source", prior.get("source", {}))
+                        prior["_fragments"] = option.get("_fragments", [])
+                    elif prior_language == incoming_language:
+                        reason = f"Repeated option {option['id']} has conflicting text in the same source language; the alternative was retained as evidence."
+                        prior["review_required"] = True
+                        prior["review_reasons"] = list(dict.fromkeys(prior.get("review_reasons", []) + [reason]))
+                        question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
             existing["review_reasons"] = list(dict.fromkeys(existing.get("review_reasons", []) + question.get("review_reasons", [])))
             existing["review_required"] = bool(existing["review_reasons"])
             existing["review_required"] = existing["review_required"] or question["review_required"]
@@ -1119,10 +1511,9 @@ def parse_questions(pages: list[dict]):
             sections.append(current_section.copy())
 
     for page in pages:
-        if expected_number > 50:
-            break
         page_number = page["page"]
         positioned_lines = page.get("lines", [])
+        line_order_y = {id(item[3]): item[0] for item in positioned_lines}
         if positioned_lines:
             page_lines = [(item[2], item[3]) for item in positioned_lines]
         else:
@@ -1132,7 +1523,7 @@ def parse_questions(pages: list[dict]):
         for anchor_line, anchor_bbox in page_lines:
             anchor_match = QUESTION_RE.match(anchor_line.replace("\u00a0", " ").strip())
             if anchor_match and anchor_bbox is not None:
-                positioned_anchors.append((int(anchor_match.group(1)), anchor_bbox.y0, (anchor_bbox.x0 + anchor_bbox.x1) / 2))
+                positioned_anchors.append((int(anchor_match.group(1)), line_order_y.get(id(anchor_bbox), anchor_bbox.y0), (anchor_bbox.x0 + anchor_bbox.x1) / 2))
             if anchor_bbox is not None:
                 for parsed_option in numbered_options(anchor_line.replace("\u00a0", " ").strip()):
                     option_x = anchor_bbox.x0 + (parsed_option["offset"] / max(1, len(anchor_line))) * anchor_bbox.width
@@ -1152,6 +1543,7 @@ def parse_questions(pages: list[dict]):
 
         for line, line_bbox in page_lines:
             text = line.replace("\u00a0", " ").strip()
+            source_line_y = line_order_y.get(id(line_bbox), line_bbox.y0 if line_bbox is not None else 0)
 
             if not text:
                 continue
@@ -1181,7 +1573,7 @@ def parse_questions(pages: list[dict]):
                 initial_text = question_match.group(2).strip()
                 explicitly_labeled = bool(re.match(r"^\s*(?:Q(?:uestion)?\.?\s*)\d", text, re.IGNORECASE))
                 is_next_question = number == expected_number or (
-                    expected_number < number <= 50
+                    expected_number < number
                     and (number - expected_number <= 3 or explicitly_labeled)
                 )
                 existing_question = questions_by_number.get(number)
@@ -1235,16 +1627,26 @@ def parse_questions(pages: list[dict]):
                     "source": {
                         "page": page_number,
                         "bbox": list(line_bbox) if line_bbox is not None else None,
+                        "regions": [],
+                        "content_bboxes": [],
                     },
+                    "_regions": ([{
+                        "page": page_number,
+                        "bbox": list(line_bbox),
+                        "column": _layout_column(line_bbox, page.get("width", 0)) if page.get("width") else "full",
+                    }] if line_bbox is not None else []),
                     "_source_bbox": list(line_bbox) if line_bbox is not None else None,
                     "_option_started": False,
                     "_option_anchors": {},
+                    "_option_anchor_pages": {},
                     "media": [],
                     "review_required": bool(page.get("needs_review")),
                     "review_reasons": (["The source page has an extraction or OCR warning."] if page.get("needs_review") else []),
                     "_page_needs_review": bool(page.get("needs_review")),
                     "_lines": carried_lines + pre_anchor_lines.pop(number, []) + ([initial_text] if initial_text else []),
                 }
+                if line_bbox is not None:
+                    question["source"]["content_bboxes"].append({"page": page_number, "bbox": list(line_bbox)})
 
                 continue
 
@@ -1255,11 +1657,11 @@ def parse_questions(pages: list[dict]):
             # Hold it for the upcoming same-column anchor instead of leaking it into
             # the prior question's final option.
             if line_bbox is not None:
-                nearby_question_gap = 12
+                nearby_question_gap = 36 if len(text.split()) >= 4 and not numbered_options(text) else 12
                 math_fragment = bool(
                     len(text) <= 36
                     and (
-                        re.search(r"(?:\u2192|\u20d7|\^|\u00e2\u2020\u2019|\u00e2\u0192\u2014)", text)
+                        re.search(r"(?:\u2192|\u20d7|\^|\u00e2\u2020\u2019|\u00e2\u0192\u2014|[\u03b1-\u03c9\u0391-\u03a9]\s*/\s*\d|[\u2211-\u22ff])", text)
                         or re.fullmatch(r"(?:d[xy]|d2[xy]|[xy]2|[xy]_[xy])", text, re.IGNORECASE)
                     )
                 )
@@ -1268,16 +1670,68 @@ def parse_questions(pages: list[dict]):
                 formula_fragment = math_fragment or bool(
                     re.fullmatch(r"\([^)]{1,30}\)", text)
                     and re.search(r"[\d=^+*/\u2212\u00d7\u221a]", text)
+                ) or bool(
+                    # Vector components can be emitted as one multi-group line
+                    # just above their printed question number. Preserve that
+                    # line for the upcoming question when the same-column
+                    # anchor is within the established geometric gap.
+                    len(text) <= 110
+                    and text.startswith(("(", "["))
+                    and re.search(r"[=+×·√∫∑∏^]", text)
+                    and ")" in text
                 )
                 upcoming = [
                     (anchor_number, anchor_y, anchor_x)
                     for anchor_number, anchor_y, anchor_x in positioned_anchors
-                    if anchor_y >= line_bbox.y0 and anchor_y - line_bbox.y0 <= nearby_question_gap
+                    if (
+                        (
+                            anchor_y >= source_line_y
+                            and anchor_y - source_line_y <= nearby_question_gap
+                        )
+                        # Some math fonts give a complete vector expression a
+                        # tall glyph box that straddles its printed question
+                        # number. Compare the actual box, not its derived
+                        # baseline, so that the expression is owned by the
+                        # overlapping next-question anchor rather than the
+                        # preceding question's final option.
+                        or (
+                            formula_fragment
+                            and line_bbox.y0 < anchor_y < line_bbox.y1
+                            and anchor_y - line_bbox.y0 <= nearby_question_gap
+                        )
+                    )
                     and anchor_number > int(question["question_number"])
                     and question.get("_source_bbox")
-                    and abs(anchor_x - question["_source_bbox"][0]) < page.get("width", 100000) * 0.18
+                    and (anchor_x >= page.get("width", 0) / 2) == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
                 ]
-                if upcoming and (not text.startswith(("(", "[")) or formula_fragment):
+                overlaps_next_question_anchor = bool(
+                    formula_fragment
+                    and any(line_bbox.y0 < anchor_y < line_bbox.y1 for _, anchor_y, _ in upcoming)
+                )
+                owned_by_current_option = bool(
+                    question.get("_option_started")
+                    and any(
+                        question.get("_option_anchor_pages", {}).get(option_id) == page_number
+                        and source_line_y >= anchor_y
+                        and source_line_y - anchor_y <= 22
+                        and (anchor_x >= page.get("width", 0) / 2)
+                        == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
+                        for option_id, (anchor_x, anchor_y) in question.get("_option_anchors", {}).items()
+                    )
+                )
+                option_grid_continuation = bool(
+                    question.get("_option_started")
+                    and formula_fragment
+                    and any(
+                        option_id not in {str(item["id"]) for item in question.get("options", [])}
+                        and 18 <= option_y - line_bbox.y0 <= 58
+                        and abs(option_x - line_bbox.x0) <= max(72, line_bbox.height * 5)
+                        and (option_x < page.get("width", 0) / 2)
+                        == ((line_bbox.x0 + line_bbox.x1) / 2 < page.get("width", 0) / 2)
+                        for option_id, option_x, option_y in page_option_anchors
+                    )
+                )
+                if upcoming and (overlaps_next_question_anchor or not owned_by_current_option) and not option_grid_continuation and (not text.startswith(("(", "[")) or formula_fragment):
                     target_number = min(upcoming, key=lambda item: item[1])[0]
                     pre_anchor_lines.setdefault(target_number, []).append(text)
                     continue
@@ -1298,14 +1752,83 @@ def parse_questions(pages: list[dict]):
                         (anchor_number, anchor_y)
                         for anchor_number, anchor_y, anchor_x in positioned_anchors
                         if anchor_number >= int(question["question_number"]) or anchor_number in known_parallel_numbers
-                        and anchor_y >= line_bbox.y0
-                        and anchor_y - line_bbox.y0 <= 14
+                        and anchor_y >= source_line_y
+                        and anchor_y - source_line_y <= 14
                         and (anchor_x >= page.get("width", 0) / 2) == line_side
                     ]
                     if parallel_anchors:
                         target_number = min(parallel_anchors, key=lambda item: item[1])[0]
                         pre_anchor_lines.setdefault(target_number, []).append(text)
                     continue
+
+            # A raised numerator or the upper part of an option formula can
+            # appear just before the option label in PDF reading order. Give
+            # it to that next label only when its geometry is closer to a new
+            # option anchor than to any option already opened for this question.
+            if not numbered_options(text) and line_bbox is not None and question.get("_option_started"):
+                present_ids = {str(item["id"]) for item in question["options"]}
+                option_line_y = line_bbox.y0
+                near_future = [
+                    (option_id, x, y)
+                    for option_id, x, y in page_option_anchors
+                    if option_id not in present_ids
+                    and option_line_y <= y <= option_line_y + 20
+                    and abs(x - line_bbox.x0) <= max(80, line_bbox.height * 4)
+                    and (x < page.get("width", 0) / 2)
+                    == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
+                ]
+                if near_future:
+                    next_id, _, _ = min(near_future, key=lambda item: item[2] - option_line_y)
+                    if re.search(r"[0-9=+\-−/√∫∑∏]|[A-Za-zα-ωΑ-Ω]", text):
+                        pending_option_prefix.setdefault(next_id, []).append((text, line_bbox))
+                        continue
+
+            # Some physics papers print the formula first and its numbered
+            # option marker below it. Associate such a formula with the label
+            # in the same column using the repeated vertical layout, before it
+            # can be absorbed into the question stem or a prior option.
+            if not numbered_options(text) and line_bbox is not None and question.get("_source_bbox") and len(text) <= 80:
+                option_line_y = line_bbox.y0
+                math_content = bool(re.search(r"[=+×·√∫∑∏]|(?:\d\s*/\s*\d)", text))
+                prose_words = re.findall(r"[A-Za-z]{3,}", text)
+                nearby_prose = any(
+                    other_bbox is not None
+                    and other_text != text
+                    and not QUESTION_RE.match(other_text.strip())
+                    and not numbered_options(other_text.strip())
+                    and len(re.findall(r"[A-Za-z]{2,}|[\u0900-\u097f]{2,}", other_text)) >= 3
+                    and ((other_bbox.x0 + other_bbox.x1) / 2 >= page.get("width", 0) / 2)
+                    == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
+                    and max(0, max(other_bbox.x0 - line_bbox.x1, line_bbox.x0 - other_bbox.x1)) <= 14
+                    and max(0, max(other_bbox.y0 - line_bbox.y1, line_bbox.y0 - other_bbox.y1)) <= 8
+                    for other_text, other_bbox in page_lines
+                )
+                if math_content and len(prose_words) <= 2 and not nearby_prose:
+                    same_column = (line_bbox.x0 < page.get("width", 0) / 2) == (
+                        (question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2
+                    )
+                    next_question_y = min(
+                        (anchor_y for anchor_number, anchor_y, anchor_x in positioned_anchors
+                         if anchor_number > int(question["question_number"])
+                         and anchor_y >= option_line_y
+                    and abs(anchor_x - (question["_source_bbox"][0] + question["_source_bbox"][2]) / 2) < page.get("width", 100000) * 0.25),
+                        default=float("inf"),
+                    )
+                    future_option_labels = [
+                        (option_id, x, y)
+                        for option_id, x, y in page_option_anchors
+                        if 18 <= y - option_line_y <= 58
+                        and abs(x - line_bbox.x0) <= max(72, line_bbox.height * 5)
+                        and same_column
+                        and y < next_question_y
+                    ]
+                    if future_option_labels:
+                        option_id, _, _ = min(
+                            future_option_labels,
+                            key=lambda item: (abs((item[2] - option_line_y) - 32), abs(item[1] - line_bbox.x0)),
+                        )
+                        pending_option_prefix.setdefault(option_id, []).append((text, line_bbox))
+                        continue
 
             option_lines = numbered_options(text)
 
@@ -1316,17 +1839,18 @@ def parse_questions(pages: list[dict]):
                 and not re.search(r"[\u0900-\u097f]{2,}|\b(?:the|and|which|what|find|then)\b", text, re.IGNORECASE)
             )
             if option_formula_prefix and not option_lines and line_bbox is not None and not question.get("_option_started"):
+                option_line_y = line_bbox.y0
                 future_question_y = min(
                     (anchor_y for anchor_number, anchor_y, anchor_x in positioned_anchors
                      if anchor_number > int(question["question_number"])
-                     and anchor_y > line_bbox.y0
+                     and anchor_y > option_line_y
                      and abs(anchor_x - question["_source_bbox"][0]) < page.get("width", 100000) * 0.18),
                     default=float("inf"),
                 )
                 candidate_anchors = {
                     option_id: (x, y)
                     for option_id, x, y in page_option_anchors
-                    if line_bbox.y0 <= y <= line_bbox.y0 + 18 and y < future_question_y
+                    if option_line_y <= y <= option_line_y + 18 and y < future_question_y
                     and (x < page.get("width", 0) / 2)
                     == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
                 }
@@ -1341,17 +1865,18 @@ def parse_questions(pages: list[dict]):
                 and re.fullmatch(r"[\d\s^_=+\-×÷√∫→←()/.]+", text)
                 and (len(text) <= 5 or not re.search(r"[A-Za-z\u0900-\u097f]", text))
             ):
+                option_line_y = line_bbox.y0
                 future_question_y = min(
                     (anchor_y for anchor_number, anchor_y, anchor_x in positioned_anchors
                      if anchor_number > int(question["question_number"])
-                     and anchor_y > line_bbox.y0
+                     and anchor_y > option_line_y
                      and abs(anchor_x - question["_source_bbox"][0]) < page.get("width", 100000) * 0.18),
                     default=float("inf"),
                 )
                 candidate_anchors = {
                     option_id: (x, y)
                     for option_id, x, y in page_option_anchors
-                    if line_bbox.y0 <= y <= line_bbox.y0 + 18 and y < future_question_y
+                    if option_line_y <= y <= option_line_y + 18 and y < future_question_y
                     and (x < page.get("width", 0) / 2)
                     == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
                 }
@@ -1371,29 +1896,41 @@ def parse_questions(pages: list[dict]):
                     option_text = option["text"]
                     marker_x = line_bbox.x0 + (option["offset"] / max(1, len(text))) * line_bbox.width if line_bbox is not None else None
                     marker_bbox = None
+                    fragment_bbox = None
                     if line_bbox is not None and marker_x is not None:
                         marker_width = max(7, min(18, line_bbox.height * 0.8))
                         marker_bbox = fitz.Rect(marker_x, line_bbox.y0, min(line_bbox.x1, marker_x + marker_width), line_bbox.y1)
+                        later_offsets = [item["offset"] for item in option_lines if item["offset"] > option["offset"]]
+                        content_x1 = line_bbox.x0 + (min(later_offsets) / max(1, len(text))) * line_bbox.width if later_offsets else line_bbox.x1
+                        content_x0 = min(line_bbox.x1, marker_x + marker_width)
+                        fragment_bbox = fitz.Rect(content_x0, line_bbox.y0, max(content_x0, content_x1), line_bbox.y1)
                     existing_option = next((item for item in question["options"] if item["id"] == option["id"]), None)
                     if existing_option is None:
-                        question["options"].append({
+                        new_option = {
                             "id": option_id,
                             "text": option_text,
                             "original_text": option_text,
                             "media": [],
                             "source": {"page": page_number, "bbox": list(marker_bbox) if marker_bbox is not None else None, "content_bboxes": [list(line_bbox)] if line_bbox is not None else []},
                             "review_required": not bool(option_text),
-                        })
+                        }
+                        if option_text and fragment_bbox is not None:
+                            new_option["_fragments"] = [{"text": option_text, "bbox": list(fragment_bbox)}]
+                        question["options"].append(new_option)
                         if marker_x is not None:
                             question["_option_anchors"][option_id] = (marker_x, line_bbox.y0)
+                            question["_option_anchor_pages"][option_id] = page_number
                     elif option_text and existing_option["text"] != option_text:
                         old_has_latin = bool(re.search(r"[A-Za-z]", existing_option["text"]))
                         new_has_latin = bool(re.search(r"[A-Za-z]", option_text))
                         if new_has_latin and not old_has_latin:
                             existing_option["text"] = option_text
+                            existing_option["_fragments"] = ([{"text": option_text, "bbox": list(fragment_bbox)}] if option_text and fragment_bbox is not None else [])
                         elif old_has_latin == new_has_latin:
                             question["review_required"] = True
                     question["_option_started"] = True
+                    if line_bbox is not None:
+                        question["source"].setdefault("content_bboxes", []).append({"page": page_number, "bbox": list(line_bbox)})
                     pending_fragments = sorted(pending_option_prefix.pop(option_id, []), key=lambda item: (item[1].y0, item[1].x0))
                     if pending_fragments:
                         option_record = next((item for item in question["options"] if item["id"] == option_id), None)
@@ -1403,6 +1940,10 @@ def parse_questions(pages: list[dict]):
                             right_fragments = [fragment for fragment, fragment_bbox in pending_fragments if fragment_bbox.x0 > marker_x + 36]
                             option_record["text"] = " ".join(part for part in (" ".join(left_fragments), option_record["text"], " ".join(right_fragments)) if part)
                             option_record["original_text"] = option_record["text"]
+                            option_record.setdefault("_fragments", []).extend(
+                                {"text": fragment, "bbox": list(fragment_bbox)}
+                                for fragment, fragment_bbox in pending_fragments
+                            )
                             option_record.setdefault("source", {}).setdefault("content_bboxes", []).extend(list(fragment_bbox) for _, fragment_bbox in pending_fragments)
                     for fragment, fragment_bbox in pending_option_math.pop(option_id, []):
                         question.setdefault("_pending_fraction_numerators", {}).setdefault(option_id, []).append((fragment, fragment_bbox))
@@ -1426,6 +1967,7 @@ def parse_questions(pages: list[dict]):
                     if option is not None:
                         numerators = question.get("_pending_fraction_numerators", {}).get(option_id, [])
                         fraction = None
+                        fraction_bbox = None
                         if text.strip().isdigit() and line_bbox is not None:
                             for numerator, numerator_bbox in numerators:
                                 numerator_rect = fitz.Rect(numerator_bbox)
@@ -1433,6 +1975,7 @@ def parse_questions(pages: list[dict]):
                                     rule = fitz.Rect(rule_values)
                                     if numerator_rect.y1 <= rule.y0 <= line_bbox.y1 and rule.x1 >= numerator_rect.x0 and rule.x0 <= line_bbox.x1:
                                         fraction = f"{numerator}/{text.strip()}"
+                                        fraction_bbox = numerator_rect | line_bbox
                                         break
                                 denominator_center = (line_bbox.x0 + line_bbox.x1) / 2
                                 numerator_center = (numerator_rect.x0 + numerator_rect.x1) / 2
@@ -1440,26 +1983,54 @@ def parse_questions(pages: list[dict]):
                                 aligned_stack = abs(denominator_center - numerator_center) <= 8 and 0 <= vertical_gap <= 20
                                 if aligned_stack:
                                     fraction = f"{numerator}/{text.strip()}"
+                                    fraction_bbox = numerator_rect | line_bbox
                                 if fraction:
                                     break
                         addition = fraction or text
                         option["text"] = " ".join(part for part in (option["text"], addition) if part)
+                        if addition and (line_bbox is not None or fraction_bbox is not None):
+                            fragment_bbox = fraction_bbox or line_bbox
+                            option.setdefault("_fragments", []).append({"text": addition, "bbox": list(fragment_bbox)})
                         if fraction:
                             question["_pending_fraction_numerators"][option_id].remove(next(item for item in numerators if item[0] == fraction.split("/", 1)[0]))
                         if line_bbox is not None:
                             option.setdefault("source", {}).setdefault("content_bboxes", []).append(list(line_bbox))
+                            question["source"].setdefault("content_bboxes", []).append({"page": page_number, "bbox": list(line_bbox)})
                         option["original_text"] = option["text"]
                         option["review_required"] = not bool(option["text"].strip())
                     continue
             question["_lines"].append(text)
-
-        if question is not None and int(question["question_number"]) == 50:
-            flush_question()
+            if line_bbox is not None:
+                question["source"].setdefault("content_bboxes", []).append({"page": page_number, "bbox": list(line_bbox)})
 
     flush_question()
 
     if current_section["questions"]:
         sections.append(current_section)
+
+    # Use a section's repeated label pattern as evidence of missing options.
+    # A lone three-choice question remains valid; a deviation is only flagged
+    # when another question establishes a longer option-label pattern.
+    for section in sections:
+        patterns = [
+            tuple(str(option["id"]) for option in question.get("options", []))
+            for question in section["questions"]
+            if question.get("question_type") == "mcq"
+        ]
+        repeated = Counter(pattern for pattern in patterns if len(pattern) >= 3)
+        if not repeated:
+            continue
+        expected_pattern, occurrences = repeated.most_common(1)[0]
+        if occurrences < 1:
+            continue
+        for question in section["questions"]:
+            if question.get("question_type") != "mcq":
+                continue
+            actual = tuple(str(option["id"]) for option in question.get("options", []))
+            if actual and set(actual) < set(expected_pattern):
+                reason = f"This question has fewer option labels than the section's recurring pattern ({', '.join(expected_pattern)}); verify whether the source has omitted choices."
+                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+                question["review_required"] = True
 
     return sections
 
@@ -1505,23 +2076,23 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
         for other in question["options"]
         if other is not option and other.get("source", {}).get("bbox")
         and fitz.Rect(other["source"]["bbox"]).y0 > marker.y0 + 10
-        and abs(fitz.Rect(other["source"]["bbox"]).x0 - marker.x0) < 35
+        and _layout_column(fitz.Rect(other["source"]["bbox"]), page_width) == _layout_column(marker, page_width)
     ]
+    marker_column = _layout_column(marker, page_width)
     next_questions = [
-        float(line[0]) for line in page_data.get("lines", [])
-        if (match := QUESTION_RE.match(line[2]))
+        float(line[0])
+        for line in page_data.get("lines", [])
+        if (match := QUESTION_RE.match(line[2].replace("\u00a0", " ").strip()))
         and int(match.group(1)) > int(question["question_number"])
         and line[0] > marker.y0
-        and abs(line[1] - question.get("source", {}).get("bbox", [marker.x0])[0]) < page_width * 0.18
+        and (marker_column == "full" or _layout_column(line[3], page_width) in (marker_column, "full"))
     ]
     content_y0 = min([marker.y0] + [rect.y0 for rect in content_rectangles])
-    content_y1 = (
-        max([marker.y1] + [rect.y1 for rect in content_rectangles])
-        if content_rectangles
-        else marker.y0 + 42
-    )
+    content_y1 = max([marker.y1] + [rect.y1 for rect in content_rectangles]) if content_rectangles else None
+    cell_end = min([row for row in later_rows] + next_questions + [page_height - 12])
     y0 = max(0, content_y0 - padding)
-    y1 = min([row - padding for row in later_rows] + next_questions + [content_y1 + padding, marker.y0 + 42, page_height - 12])
+    option_extent = content_y1 + padding if content_y1 is not None else marker.y0 + 42
+    y1 = min(cell_end - padding, option_extent)
     clip = fitz.Rect(x0, y0, x1, y1)
     if clip.width < 18 or clip.height < 12:
         return None
@@ -1563,142 +2134,168 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
         for page in pages
     }
 
-    for section in sections:
-        for question in section["questions"]:
-            page_number = question["source"]["page"]
+    questions = [question for section in sections for question in section["questions"]]
+    asset_candidates: dict[str, list[tuple[float, dict, dict]]] = {}
+    for question in questions:
+        number = int(question["question_number"])
+        source_regions = question.get("source", {}).get("regions", [])
+        if not source_regions:
+            source_bbox = question.get("source", {}).get("bbox")
+            if source_bbox:
+                source_regions = [{
+                    "page": question.get("source", {}).get("page"),
+                    "bbox": source_bbox,
+                    "column": "full",
+                }]
+
+        for region in source_regions:
+            page_number = region.get("page")
             page = page_map.get(page_number)
-
-            if not page or not page.get("lines"):
+            if page is None or not region.get("bbox"):
                 continue
-
-            number = int(question["question_number"])
-            source_bbox = question.get("_source_bbox")
-
-            start_lines = [
-                item
-                for item in page["lines"]
-                if QUESTION_RE.match(item[2])
-                and int(
-                    QUESTION_RE.match(item[2]).group(1)
-                ) == number
-            ]
-
-            if not start_lines:
-                reason = "Question position could not be mapped to PDF coordinates, so media association was skipped."
-                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
-                question["review_required"] = True
-                continue
-
-            start_y = min(item[0] for item in start_lines)
-            start_x = source_bbox[0] if source_bbox else min(item[1] for item in start_lines)
-
+            anchor = fitz.Rect(region["bbox"])
+            page_width = float(page.get("width", 0) or 0)
+            column = region.get("column") or _layout_column(anchor, page_width)
             next_positions = []
-
-            for y, x, text, bbox, *_ in page["lines"]:
-                match = QUESTION_RE.match(text)
-
-                # A bilingual duplicate anchor may place the question in either page column.
-                # Use the next numbered anchor across both columns to close the vertical region.
-                if match and int(match.group(1)) > number and y > start_y:
-                    next_positions.append(y)
-
-            end_y = min(
-                next_positions,
-                default=float("inf"),
-            )
+            for line in page.get("lines", []):
+                match = QUESTION_RE.match(line[2].replace("\u00a0", " ").strip())
+                if not match or int(match.group(1)) <= number or line[0] <= anchor.y0:
+                    continue
+                next_bbox = line[3]
+                next_column = _layout_column(next_bbox, page_width) if page_width else "full"
+                if column == "full" or next_column == column or next_column == "full":
+                    next_positions.append(line[0])
+            end_y = min(next_positions, default=float(page.get("height", anchor.y1 + 1)))
 
             for asset in media:
-                if asset["source_page"] != page_number:
+                if asset.get("source_page") != page_number or not asset.get("bbox"):
                     continue
-
-                bbox = asset.get("bbox")
-
-                if not bbox:
+                if asset.get("type") == "diagnostic_page":
                     continue
+                asset_rect = fitz.Rect(asset["bbox"])
+                asset_column = _layout_column(asset_rect, page_width) if page_width else "full"
+                if column != "full" and asset_column not in (column, "full"):
+                    continue
+                if not (asset_rect.y0 >= anchor.y0 - 12 and asset_rect.y0 < end_y and asset_rect.y1 <= end_y + 12):
+                    continue
+                vertical_gap = max(anchor.y0 - asset_rect.y1, asset_rect.y0 - anchor.y1, 0)
+                horizontal_gap = max(anchor.x0 - asset_rect.x1, asset_rect.x0 - anchor.x1, 0)
+                score = vertical_gap + min(horizontal_gap, page_width if page_width else horizontal_gap)
+                asset_candidates.setdefault(asset["asset_id"], []).append((score, question, {**asset, "source_page": page_number}))
 
-                rect = fitz.Rect(bbox)
-
-                if (
-                    rect.y0 >= start_y - 8
-                    and rect.y0 < end_y
-                    and rect.y1 < end_y + 10
-                ):
-                    if not any(item.get("asset_id") == asset.get("asset_id") for item in question["media"]):
-                        question["media"].append({**asset, "source_page": page_number})
-
-            english_stem = question.get("question", {}).get("en") or ""
-            if question["media"] and (len(english_stem.strip()) < 28 or re.fullmatch(r"(?:shown in the figure|as shown in figure|shown in figure)\s*[:-]?", english_stem.strip(), re.IGNORECASE)):
-                reason = "Question text is unusually short for a figure-based question; verify that the complete stem is present."
+    # A single source asset is assigned once. If geometry cannot distinguish
+    # between nearby questions, retain it in the manifest as unassociated.
+    for asset_id, candidates in asset_candidates.items():
+        unique_candidates = {}
+        for score, question, asset in candidates:
+            unique_candidates[question["question_id"]] = min(
+                unique_candidates.get(question["question_id"], (float("inf"), question, asset)),
+                (score, question, asset),
+                key=lambda item: item[0],
+            )
+        ranked = sorted(unique_candidates.values(), key=lambda item: item[0])
+        if len(ranked) > 1 and ranked[1][0] - ranked[0][0] <= 8:
+            reason = f"Media asset {asset_id} falls in overlapping question regions; association was left unresolved."
+            for _, question, _ in ranked[:2]:
                 question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
                 question["review_required"] = True
+            continue
+        _, question, asset = ranked[0]
+        if not any(item.get("asset_id") == asset_id for item in question["media"]):
+            question["media"].append(asset)
 
-            # Only promote a vector crop to an option when it is physically adjacent
-            # to that option's own text box. Each asset can belong to at most one choice.
-            assigned_assets = set()
-            for option in question["options"]:
-                option_bbox = option.get("source", {}).get("bbox")
-                if not option_bbox:
-                    continue
-                option_rect = fitz.Rect(option_bbox)
-                for asset in question["media"]:
-                    asset_bbox = asset.get("bbox")
-                    if asset.get("type") != "diagram" or not asset_bbox or asset.get("asset_id") in assigned_assets:
-                        continue
-                    asset_rect = fitz.Rect(asset_bbox)
-                    horizontal_gap = max(option_rect.x0 - asset_rect.x1, asset_rect.x0 - option_rect.x1, 0)
-                    vertical_gap = max(option_rect.y0 - asset_rect.y1, asset_rect.y0 - option_rect.y1, 0)
-                    overlaps_inline = option_rect.y0 <= asset_rect.y1 and asset_rect.y0 <= option_rect.y1
-                    if horizontal_gap <= 100 and vertical_gap <= 120 and (overlaps_inline or vertical_gap > 0):
-                        option["media"].append(dict(asset))
-                        option["review_required"] = False
-                        assigned_assets.add(asset.get("asset_id"))
-                        break
-            if assigned_assets:
-                question["media"] = [asset for asset in question["media"] if asset.get("asset_id") not in assigned_assets]
-                if all(option["text"].strip() or option["media"] for option in question["options"]):
-                    question["review_reasons"] = [
-                        reason for reason in question.get("review_reasons", [])
-                        if reason != "One or more options have neither readable text nor associated media."
-                    ]
-                    question["review_required"] = bool(question["review_reasons"])
+    for question in questions:
+        page_number = question.get("source", {}).get("page")
+        page = page_map.get(page_number)
+        if not page:
+            continue
 
-            for option in question["options"]:
-                option_text = option.get("text", "")
-                suspicious_math = bool(_has_encoding_artifacts(option_text) or _has_displaced_short_option_content(option) or re.search(r"(?:\d\s+\d\s*/\s*\d|\d/\d\s+\d/\d|(?:^|\s)[=+*/]\s{2,}|[A-Za-z)]\d(?:/|\b)|[=+\-−]\s*$)", option_text))
-                if option.get("media") or (option_text.strip() and not suspicious_math):
-                    continue
-                crop = _crop_option_source(option, question, page, source_document, media_dir)
-                if crop:
-                    option["media"].append(crop)
-                    option["review_required"] = True
-                    reason = f"Option {option['id']} has a source crop for verification because its mathematical text may be incomplete."
-                    option["review_reasons"] = list(dict.fromkeys(option.get("review_reasons", []) + [reason]))
-                    option.setdefault("math_evidence", []).append({
-                        "original_text": option.get("original_text") or option_text,
-                        "reconstructed_text": None,
-                        "normalized_text": None,
-                        "latex": None,
-                        "mathml": None,
-                        "source_page": crop.get("source_page"),
-                        "source_bbox": crop.get("bbox"),
-                        "component_bboxes": option.get("source", {}).get("content_bboxes", []),
-                        "extraction_method": "high_resolution_source_region_render",
-                        "confidence": None,
-                        "review_required": True,
-                        "review_reasons": [reason],
-                    })
-                    question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
-            if all(option.get("text", "").strip() or option.get("media") for option in question["options"]):
+        if page is None:
+            continue
+        english_stem = question.get("question", {}).get("en") or ""
+        if question["media"] and (len(english_stem.strip()) < 28 or re.fullmatch(r"(?:shown in the figure|as shown in figure|shown in figure)\s*[:-]?", english_stem.strip(), re.IGNORECASE)):
+            reason = "Question text is unusually short for a figure-based question; verify that the complete stem is present."
+            question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+            question["review_required"] = True
+
+        # Associate a diagram with the nearest option only when the geometry is
+        # sufficiently clear. Do not let the first option in list order win.
+        assigned_assets = set()
+        boxed_options = [
+            (option, fitz.Rect(option["source"]["bbox"]))
+            for option in question["options"]
+            if option.get("source", {}).get("bbox")
+        ]
+        for asset in question["media"]:
+            if asset.get("type") != "diagram" or not asset.get("bbox"):
+                continue
+            asset_rect = fitz.Rect(asset["bbox"])
+            candidates = []
+            for option, option_rect in boxed_options:
+                horizontal_gap = max(option_rect.x0 - asset_rect.x1, asset_rect.x0 - option_rect.x1, 0)
+                vertical_gap = max(option_rect.y0 - asset_rect.y1, asset_rect.y0 - option_rect.y1, 0)
+                overlaps_inline = option_rect.y0 <= asset_rect.y1 and asset_rect.y0 <= option_rect.y1
+                if horizontal_gap <= 48 and vertical_gap <= 52 and (overlaps_inline or asset_rect.y0 >= option_rect.y1):
+                    candidates.append((horizontal_gap + vertical_gap, option))
+            candidates.sort(key=lambda item: item[0])
+            if not candidates:
+                continue
+            if len(candidates) > 1 and candidates[1][0] - candidates[0][0] <= 8:
+                reason = f"Diagram {asset.get('asset_id')} is close to multiple options; option association was left unresolved."
+                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+                question["review_required"] = True
+                continue
+            _, option = candidates[0]
+            option["media"].append(dict(asset))
+            option["review_required"] = True
+            option.setdefault("review_reasons", []).append("Nearby vector diagram association is geometry-based and requires visual review.")
+            assigned_assets.add(asset.get("asset_id"))
+        if assigned_assets:
+            question["media"] = [asset for asset in question["media"] if asset.get("asset_id") not in assigned_assets]
+            if all(option["text"].strip() or option["media"] for option in question["options"]):
                 question["review_reasons"] = [
                     reason for reason in question.get("review_reasons", [])
                     if reason != "One or more options have neither readable text nor associated media."
                 ]
-                question["review_required"] = bool(question["review_reasons"]) or any(option.get("review_required") for option in question["options"])
+                question["review_required"] = bool(question["review_reasons"])
 
-            if len({option["id"] for option in question["options"]}) < 4 and question.get("_option_started"):
-                reason = "One or more numbered choices were not recovered from the source text."
+        for option in question["options"]:
+            option_text = option.get("text", "")
+            suspicious_math = bool(_has_encoding_artifacts(option_text) or _has_displaced_short_option_content(option) or _has_suspicious_math_layout(option_text) or re.search(r"(?:\d\s+\d\s*/\s*\d|\d/\d\s+\d/\d|(?:^|\s)[=+*/]\s{2,}|[A-Za-z)]\d(?:/|\b)|[=+\-−]\s*$)", option_text))
+            if option.get("media") or (option_text.strip() and not suspicious_math):
+                continue
+            crop = _crop_option_source(option, question, page, source_document, media_dir)
+            if crop:
+                option["media"].append(crop)
+                option["review_required"] = True
+                reason = f"Option {option['id']} has a source crop for verification because its mathematical text may be incomplete."
+                option["review_reasons"] = list(dict.fromkeys(option.get("review_reasons", []) + [reason]))
+                option.setdefault("math_evidence", []).append({
+                    "original_text": option.get("original_text") or option_text,
+                    "reconstructed_text": None,
+                    "normalized_text": None,
+                    "latex": None,
+                    "mathml": None,
+                    "source_page": crop.get("source_page"),
+                    "source_bbox": crop.get("bbox"),
+                    "component_bboxes": option.get("source", {}).get("content_bboxes", []),
+                    "extraction_method": "high_resolution_source_region_render",
+                    "confidence": None,
+                    "review_required": True,
+                    "review_reasons": [reason],
+                })
                 question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
-                question["review_required"] = True
+        if all(option.get("text", "").strip() or option.get("media") for option in question["options"]):
+            question["review_reasons"] = [
+                reason for reason in question.get("review_reasons", [])
+                if reason != "One or more options have neither readable text nor associated media."
+            ]
+            question["review_required"] = bool(question["review_reasons"]) or any(option.get("review_required") for option in question["options"])
+
+        if len({option["id"] for option in question["options"]}) < 4 and question.get("_option_started"):
+            reason = "One or more numbered choices were not recovered from the source text."
+            question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+            question["review_required"] = True
 
 
 def verify_suspicious_option_crops(sections, media_dir: Path) -> dict:
@@ -1894,6 +2491,7 @@ def run_conversion(
                 # Keep source coordinates in output for audit/debugging.
                 parsed_question.pop("_option_started", None)
                 parsed_question.pop("_option_anchors", None)
+                parsed_question.pop("_option_anchor_pages", None)
                 parsed_question.pop("_page_needs_review", None)
                 parsed_question.pop("_source_bbox", None)
 

@@ -60,6 +60,7 @@ def test_ollama_invalid_or_incomplete_response_is_rejected(tmp_path, monkeypatch
 def test_ollama_disabled_is_a_no_call_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "ollama_enabled", False)
     monkeypatch.setattr(engine, "verify_math_image", lambda *_args, **_kwargs: pytest.fail("disabled Ollama must not be called"))
+    monkeypatch.setattr(httpx, "get", lambda *_args, **_kwargs: pytest.fail("disabled Ollama must not be queried"))
 
     result = engine.verify_suspicious_option_crops([], tmp_path)
 
