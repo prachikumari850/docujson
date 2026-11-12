@@ -1,6 +1,10 @@
 import { useMemo, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import MediaPreview from "./MediaPreview";
+import MathEvidencePreview from "./MathEvidencePreview";
+import { splitMediaForPreview } from "../utils/mediaPresentation";
+import { getValidatedMathOnlyOption, splitInlineVectorNotation } from "../utils/inlineMath";
+import { renderValidatedLatex } from "../utils/mathRenderer";
 
 const PAGE_SIZE = 25;
 const RAW_JSON_LIMIT = 30000;
@@ -17,12 +21,23 @@ function Badge({ children, tone = "bg-lavender text-deep-purple" }) {
 
 function QuestionText({ text }) {
     if (!text) return null;
+    const renderText = (value, lang) => (
+        <span lang={lang}>
+            {splitInlineVectorNotation(value).map((part, index) => {
+                if (part.type === "text") return <span key={`${lang}-${index}`}>{part.value}</span>;
+                const rendered = renderValidatedLatex(part.latex, { reviewRequired: false });
+                return rendered.status === "rendered"
+                    ? <span key={`${lang}-${index}`} className="align-baseline" dangerouslySetInnerHTML={{ __html: rendered.html }} />
+                    : <span key={`${lang}-${index}`}>{part.source}</span>;
+            })}
+        </span>
+    );
     return (
         <>
-            {text.en && <p className="whitespace-pre-wrap text-base font-medium text-navy">{text.en}</p>}
+            {text.en && <p className="whitespace-pre-wrap text-base font-medium text-navy">{renderText(text.en, "en")}</p>}
             {text.hi && (
                 <p lang="hi" className="mt-1 whitespace-pre-wrap text-base text-navy/85">
-                    {text.hi}
+                    {renderText(text.hi, "hi")}
                 </p>
             )}
         </>
@@ -37,6 +52,12 @@ function OptionList({ options, correctAnswer, conversionId }) {
         <ul className="mt-3 grid gap-2 sm:grid-cols-2">
             {visibleOptions.map((option, index) => {
                 const correct = correctAnswer !== null && correctAnswer !== undefined && String(correctAnswer) === String(option.id);
+                const hasText = Boolean(option.text?.trim());
+                const media = splitMediaForPreview(option.media, hasText);
+                const validatedMath = getValidatedMathOnlyOption(option.text, option.math_evidence);
+                const renderedMath = validatedMath
+                    ? renderValidatedLatex(validatedMath, { reviewRequired: false })
+                    : null;
                 return (
                     <li
                         key={option.id ?? index}
@@ -44,15 +65,40 @@ function OptionList({ options, correctAnswer, conversionId }) {
                             }`}
                     >
                         <span className="font-bold text-deep-purple">{/^\d+$/.test(String(option.id)) ? `(${option.id})` : `${option.id}.`}</span>
-                        <span className="min-w-0 whitespace-pre-wrap break-words text-navy">
-                            {option.text?.trim() || (!option.media?.length && <span className="italic text-amber-800">Text could not be recovered; review the source.</span>)}
+                        <div className="min-w-0 flex-1 whitespace-pre-wrap break-words text-navy">
+                            {renderedMath?.status === "rendered" ? (
+                                <>
+                                    <span className="inline-block max-w-full overflow-x-auto overflow-y-hidden align-middle" aria-label={`Validated option ${option.id} formula`} dangerouslySetInnerHTML={{ __html: renderedMath.html }} />
+                                    <details className="mt-2 text-xs text-navy/70">
+                                        <summary className="cursor-pointer font-semibold">Original extracted formula text</summary>
+                                        <p className="mt-1 whitespace-pre-wrap">{option.text}</p>
+                                    </details>
+                                </>
+                            ) : (
+                                <>
+                                    {hasText ? splitInlineVectorNotation(option.text.trim()).map((part, partIndex) => {
+                                        if (part.type === "text") return <span key={`${option.id}-text-${partIndex}`}>{part.value}</span>;
+                                        const vector = renderValidatedLatex(part.latex, { reviewRequired: false });
+                                        return vector.status === "rendered"
+                                            ? <span key={`${option.id}-math-${partIndex}`} dangerouslySetInnerHTML={{ __html: vector.html }} />
+                                            : <span key={`${option.id}-raw-${partIndex}`}>{part.source}</span>;
+                                    }) : (!media.content.length && <span className="italic text-amber-800">Text could not be recovered; review the source.</span>)}
+                                </>
+                            )}
+                            <MathEvidencePreview evidence={option.math_evidence} conversionId={conversionId} inline={!hasText} suppressExpression={renderedMath?.status === "rendered"} />
                             {option.vision_verification?.candidate_transcription && (
                                 <span className="mt-2 block rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
                                     <strong>Unverified local vision candidate:</strong> {option.vision_verification.candidate_transcription}
                                 </span>
                             )}
-                            {option.media?.length > 0 && <MediaPreview media={option.media} conversionId={conversionId} />}
-                        </span>
+                            {media.content.length > 0 && <MediaPreview media={media.content} conversionId={conversionId} />}
+                            {media.evidence.length > 0 && (
+                                <details className="mt-3 rounded-lg border border-lavender/70 bg-lavender-light/30 p-2 text-xs text-navy/80">
+                                    <summary className="cursor-pointer font-semibold">Source crops and media evidence ({media.evidence.length})</summary>
+                                    <MediaPreview media={media.evidence} conversionId={conversionId} />
+                                </details>
+                            )}
+                        </div>
                     </li>
                 );
             })}
@@ -79,6 +125,7 @@ function QuestionCard({ question, conversionId }) {
                 )}
             </div>
             <QuestionText text={question.question} />
+            <MathEvidencePreview evidence={question.math_evidence} conversionId={conversionId} inline={!question.question?.en?.trim() && !question.question?.hi?.trim()} />
             <OptionList options={question.options} correctAnswer={question.correct_answer} conversionId={conversionId} />
             {question.review_required && question.review_reasons?.length > 0 && (
                 <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">

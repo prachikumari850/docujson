@@ -39,6 +39,23 @@ def make_pdf():
     return content
 
 
+def make_vector_diagram_pdf():
+    document = fitz.open()
+    page = document.new_page(width=360, height=440)
+    page.insert_text((45, 55), "1. Select the graph with an increasing curve.")
+    page.draw_line((105, 250), (245, 250), color=(0, 0, 0), width=1.2)
+    page.draw_line((115, 265), (115, 125), color=(0, 0, 0), width=1.2)
+    page.draw_line((115, 250), (150, 220), color=(0.1, 0.2, 0.8), width=1.5)
+    page.draw_bezier((150, 220), (175, 190), (205, 160), (235, 135), color=(0.1, 0.2, 0.8), width=1.5)
+    page.draw_line((238, 135), (230, 138), color=(0.1, 0.2, 0.8), width=1.5)
+    page.insert_text((248, 253), "x")
+    page.insert_text((108, 120), "y")
+    page.insert_text((45, 325), "(1) graph A    (2) graph B    (3) graph C")
+    data = document.tobytes()
+    document.close()
+    return data
+
+
 def upload(client, filename="questions.txt", content=b"Sample question paper\n1. What is 2 + 2?\nA. 3\nB. 4\n", roles=None):
     data = {"roles": json.dumps(roles or {filename: "question_paper"})}
     response = client.post("/api/convert", files={"files": (filename, content)}, data=data)
@@ -71,10 +88,58 @@ def test_valid_document_formats_complete_and_download(client, filename, content)
     json_response = client.get(f"/api/conversions/{conversion_id}/json")
     assert json_response.status_code == 200
     assert json.loads(json_response.content)["document"]["source_format"] == filename.rsplit(".", 1)[1]
+    exported = json.loads(json_response.content)
+    assert exported["document"]["document_id"]
+    assert exported["document"]["source_sha256"]
+    assert exported["document"]["extraction_date"]
+    assert exported["document"]["schema_version"] == "2.1"
     zip_response = client.get(f"/api/conversions/{conversion_id}/zip")
     assert zip_response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
         assert "document.json" in archive.namelist()
+        zipped = json.loads(archive.read("document.json"))
+        assert zipped == exported
+
+
+def test_vector_graph_export_and_zip_paths_are_genuine_and_portable(client):
+    response = upload(client, "graph.pdf", make_vector_diagram_pdf())
+    assert response.status_code == 200
+    conversion_id = response.json()["conversion_id"]
+    status = client.get(f"/api/conversions/{conversion_id}").json()
+    assert status["status"] == "completed", status.get("error")
+    questions = [question for section in status["result"]["sections"] for question in section["questions"]]
+    assert len(questions) == 1
+    json_result = client.get(f"/api/conversions/{conversion_id}/json").json()
+    assert json_result["sections"] == status["result"]["sections"]
+    assert json_result["document"]["document_id"] == json_result["document"]["source_sha256"][:16]
+    question = questions[0]
+    assert question["stable_id"].startswith(json_result["document"]["document_id"][:12])
+    assert question["section"]
+    assert all(option["stable_id"].startswith(question["stable_id"]) for option in question["options"])
+    assert question["ordered_segments"]
+
+    media_items = [asset for question in questions for asset in question.get("media", [])]
+    media_items.extend(asset for question in questions for option in question["options"] for asset in option.get("media", []))
+    vector_items = [asset for asset in media_items if asset.get("media_format") == "svg_vector"]
+    assert vector_items, "The synthetic PDF's source drawing geometry should yield genuine SVG."
+    zip_response = client.get(f"/api/conversions/{conversion_id}/zip")
+    assert zip_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
+        names = set(archive.namelist())
+        assert "media/manifest.json" in names
+        for asset in media_items:
+            assert asset["relative_path"] in names
+            if asset.get("svg_relative_path"):
+                assert asset["svg_relative_path"] in names
+        import xml.etree.ElementTree as ET
+        for asset in vector_items:
+            root = ET.fromstring(archive.read(asset["svg_relative_path"]))
+            assert root.tag == "{http://www.w3.org/2000/svg}svg"
+            assert root.find(".//{http://www.w3.org/2000/svg}path") is not None
+            assert root.find(".//{http://www.w3.org/2000/svg}image") is None
+    svg_response = client.get(f"/api/conversions/{conversion_id}/media/{vector_items[0]['svg_filename']}")
+    assert svg_response.status_code == 200
+    assert svg_response.headers["content-type"].startswith("image/svg+xml")
 
 
 def test_legacy_single_file_field(client):

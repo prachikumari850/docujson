@@ -327,6 +327,10 @@ async def download_zip(conversion_id: str):
         if debug_path.is_file():
             archive.write(debug_path, arcname="debug/extraction_debug.json")
 
+        classification_debug_path = root / "classification_debug.json"
+        if classification_debug_path.is_file():
+            archive.write(classification_debug_path, arcname="debug/classification_debug.json")
+
         manifest_path = root / "media_manifest.json"
         if manifest_path.is_file():
             archive.write(manifest_path, arcname="media/manifest.json")

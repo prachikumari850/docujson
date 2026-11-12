@@ -3,7 +3,10 @@ import hashlib
 import logging
 import os
 import re
+import mimetypes
+import xml.etree.ElementTree as ET
 from collections import Counter
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -14,8 +17,11 @@ import pytesseract
 
 from app.config import settings
 from app.models import DocumentResult
+from app.ir import child_id as ir_child_id, question_id as ir_question_id
 from app.storage import update_job
 from app.services.answer_key import parse_answer_key
+from app.services.svg_render import attach_raster_svg_wrappers, reconstruct_pdf_vector_svg
+from app.services.math_pipeline import attach_math_evidence, page_math_segments, validate_segmentation
 from app.services.vision import verify_math_image
 
 logger = logging.getLogger("docujson")
@@ -26,7 +32,7 @@ QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-OPTION_RE = re.compile(r"(?:\(([1-4])\)|\[([1-4])\]|([A-Da-d])[).:])\s*")
+OPTION_RE = re.compile(r"(?:\((\d{1,3})\)|\[(\d{1,3})\]|\(([A-Ha-h])\)|\[([A-Ha-h])\]|([A-Da-d])[).:])\s*")
 
 ANSWER_RE = re.compile(
     r"^\s*(?:ans(?:wer)?|उत्तर)\s*[:.-]\s*(.+)$",
@@ -54,6 +60,10 @@ def bilingual(text: str) -> dict:
     english = []
     hindi = []
     language_neutral_math = []
+    total_hindi = len(re.findall(r"[\u0900-\u097f]", text))
+    total_latin = len(re.findall(r"[A-Za-z]", text))
+    dominant_language = "hi" if total_hindi > total_latin else "en"
+    has_both_languages = total_hindi > 0 and total_latin > 0
 
     for line in lines:
         has_hindi = bool(
@@ -62,6 +72,24 @@ def bilingual(text: str) -> dict:
         has_english = bool(
             re.search(r"[A-Za-z]", line)
         )
+        word_tokens = re.findall(r"[A-Za-z\u0900-\u097f]{2,}", line)
+        math_marked = bool(re.search(r"[=+*/^âˆ’Ã—Â·â†’âƒ—âˆšâˆ«âˆ‘âˆ√∫∑∏→⃗̂]", line))
+        math_only = math_marked and len(word_tokens) <= 2 and len(re.findall(r"[A-Za-z]", line)) <= 8
+
+        # Vector formula spans are often emitted separately from bilingual
+        # prose. Assign those spans to the dominant language of this local
+        # question/column instead of defaulting every Latin variable to English.
+        # Detached math/vector fragments use the language dominant in their
+        # own column. Latin variable names alone do not make a Hindi formula
+        # English prose; genuinely language-neutral symbol lines are shared.
+        if math_only:
+            if has_both_languages and not has_english:
+                language_neutral_math.append(line)
+            elif dominant_language == "hi":
+                hindi.append(line)
+            else:
+                english.append(line)
+            continue
 
         if has_hindi and has_english:
             hindi_count = len(re.findall(r"[\u0900-\u097f]", line))
@@ -134,7 +162,7 @@ def numbered_options(line: str) -> list[dict[str, str]]:
     previous = next(group for group in candidates[0].groups() if group).upper()
     for marker in candidates[1:]:
         current = next(group for group in marker.groups() if group).upper()
-        follows = (previous.isdigit() and current.isdigit() and int(current) == int(previous) + 1) or (previous in "ABCD" and current in "ABCD" and "ABCD".index(current) == "ABCD".index(previous) + 1)
+        follows = (previous.isdigit() and current.isdigit() and int(current) == int(previous) + 1) or (len(previous) == len(current) == 1 and previous.isalpha() and current.isalpha() and ord(current) == ord(previous) + 1)
         if follows:
             markers.append(marker)
             previous = current
@@ -147,10 +175,10 @@ def numbered_options(line: str) -> list[dict[str, str]]:
     return options
 
 
-def _option_for_position(anchors: dict, line_bbox, max_vertical_gap: float = 42):
+def _option_for_position(anchors: dict, line_bbox, max_vertical_gap: float = 42, line_y: float | None = None):
     if line_bbox is None or not anchors:
         return None
-    x, y = line_bbox.x0, line_bbox.y0
+    x, y = line_bbox.x0, line_bbox.y0 if line_y is None else line_y
     nearby = [(option_id, point) for option_id, point in anchors.items() if abs(point[1] - y) <= max_vertical_gap]
     if not nearby:
         return None
@@ -219,6 +247,42 @@ def _spatial_reflow_fragments(fragments: list[dict]) -> str:
         " ".join(text for _, text in sorted(row, key=lambda item: item[0].x0))
         for row in rows
     ).strip()
+
+
+def _is_math_or_symbol_line(text: str) -> bool:
+    """Identify line-like math evidence for bilingual duplicate reconciliation."""
+    value = text.strip()
+    return bool(value and re.search(r"[=+*/^_∫√∛∑∏πθ∞≤≥≠≈×÷±−→⃗̂]", value)
+                and len(re.findall(r"[A-Za-z]{2,}|[\u0900-\u097f]{2,}", value)) <= 5)
+
+
+def _merge_bilingual_field(existing: str | None, incoming: str | None) -> str | None:
+    """Merge duplicate column copies without repeating identical math rows.
+
+    Bilingual source pages often repeat a formula in each language column. When
+    the parser merges the two spatial question records, an identical formula
+    line must remain once in each language field, while distinct prose is kept.
+    """
+    if not existing:
+        return incoming
+    if not incoming or incoming in existing:
+        return existing
+    existing_lines = existing.splitlines()
+    known_math = {re.sub(r"\s+", "", line).casefold() for line in existing_lines if _is_math_or_symbol_line(line)}
+    additions = []
+    for line in incoming.splitlines():
+        key = re.sub(r"\s+", "", line).casefold()
+        if _is_math_or_symbol_line(line) and key in known_math:
+            continue
+        additions.append(line)
+        if _is_math_or_symbol_line(line):
+            known_math.add(key)
+    if not additions:
+        return existing
+    addition = "\n".join(additions).strip()
+    if not addition or addition in existing:
+        return existing
+    return "\n".join((existing.rstrip(), addition))
 
 
 def image_bytes(data: bytes):
@@ -302,6 +366,17 @@ def _text_quality(text: str) -> float:
 def _has_encoding_artifacts(text: str) -> bool:
     """Detect likely mojibake without mutating the original extracted evidence."""
     return bool(re.search(r"(?:Ã[\u0080-\u00ff]|Â[\u0080-\u00ff]|â(?:€|‚|ƒ|ˆ|…|—|™|[\u0080-\u00ff])|áµ[\u0080-\u00ff]|ðŸ|\ufffd|[\uf000-\uf8ff])", text))
+
+
+def _has_detached_vector_combining_mark(text: str) -> bool:
+    """Detect detached vector accents; U+2192 remains a directional operator."""
+    for index, character in enumerate(text):
+        if character != "\u20d7":
+            continue
+        previous = text[index - 1] if index else ""
+        if not previous or previous.isspace() or not previous.isalnum():
+            return True
+    return False
 
 
 def _has_displaced_short_option_content(option: dict) -> bool:
@@ -548,10 +623,84 @@ def _ordered_layout_lines(lines, page_width: float):
         return [], None
 
     def order_rows(items):
-        # Keep native visual order based on the span rectangle. The separate
-        # baseline value is used by the parser for ownership only; sorting the
-        # rendered page by baselines reorders stacked bilingual option cells.
-        return sorted(items, key=lambda item: (item[3].y0, item[3].x0))
+        # PyMuPDF can place prose and inline math on the same visual row in
+        # separate blocks whose bbox.y0 differs by a fraction of a point. A
+        # strict (y0, x0) order then moves prose ahead of the expression.
+        # Group only near-identical top coordinates, then order left-to-right.
+        # Larger vertical offsets (including tall vector-arrow boxes) retain
+        # their native spatial order for option ownership.
+        visual_rows = []
+        for item in sorted(items, key=lambda value: (value[3].y0, value[3].x0)):
+            top = item[3].y0
+            row = next(
+                (candidate for candidate in reversed(visual_rows)
+                 if abs(candidate["top"] - top) <= 1.5),
+                None,
+            )
+            if row is None:
+                visual_rows.append({"top": top, "items": [item]})
+            else:
+                row["items"].append(item)
+        ordered = []
+        for row in visual_rows:
+            fragments = sorted(row["items"], key=lambda value: value[3].x0)
+            consumed = set()
+            replacements = {}
+            for target_index, target in enumerate(fragments):
+                target_text = target[2].strip()
+                target_rect = target[3]
+                if len(target_text) < 5 or target_rect.width < 25 or not target[4]:
+                    continue
+                inline_chars = []
+                for fragment_index, fragment in enumerate(fragments):
+                    if fragment_index == target_index or fragment_index in consumed or not fragment[4]:
+                        continue
+                    fragment_text = fragment[2].strip()
+                    fragment_rect = fragment[3]
+                    if not re.fullmatch(r"[A-Za-z]", fragment_text):
+                        continue
+                    if not (target_rect.x0 <= fragment_rect.x0 and fragment_rect.x1 <= target_rect.x1):
+                        continue
+                    if abs(target_rect.y0 - fragment_rect.y0) > 1.5:
+                        continue
+                    inline_chars.extend((char, span) for span in fragment[4] for char in span.get("chars", []))
+                    consumed.add(fragment_index)
+                if inline_chars:
+                    all_chars = [(char, span) for span in target[4] for char in span.get("chars", [])]
+                    all_chars.extend(inline_chars)
+                    all_chars.sort(key=lambda pair: (float(pair[0].get("bbox", [0])[0]), float(pair[0].get("bbox", [0, 0])[1])))
+                    pieces = []
+                    previous = None
+                    char_spans = []
+                    for char, parent_span in all_chars:
+                        value = char.get("c", "")
+                        if not value:
+                            continue
+                        bbox = char.get("bbox", [0, 0, 0, 0])
+                        if previous is not None and value not in (" ", "\\t") and not pieces[-1].endswith((" ", "\\t")):
+                            prior_char, prior_span = previous
+                            prior_bbox = prior_char.get("bbox", [0, 0, 0, 0])
+                            size = max(float(prior_span.get("size", 0) or 0), float(parent_span.get("size", 0) or 0))
+                            if float(bbox[0]) - float(prior_bbox[2]) > max(1.5, size * 0.18):
+                                pieces.append(" ")
+                        pieces.append(value)
+                        char_span = {
+                            key: parent_span[key]
+                            for key in ("font", "size", "flags")
+                            if key in parent_span
+                        }
+                        char_span.update({"text": value, "bbox": list(bbox), "chars": [char]})
+                        if char.get("origin"):
+                            char_span["origin"] = list(char["origin"])
+                        char_spans.append(char_span)
+                        previous = (char, parent_span)
+                    text = "".join(pieces).strip()
+                    span_order = char_spans
+                    replacements[target_index] = (target[0], target[1], text, target_rect, span_order)
+            for index, fragment in enumerate(fragments):
+                if index not in consumed:
+                    ordered.append(replacements.get(index, fragment))
+        return ordered
 
     full, left, right = [], [], []
     for item in lines:
@@ -586,6 +735,39 @@ def _ordered_layout_lines(lines, page_width: float):
         "right": [min(item[3].x0 for item in right), max(item[3].x1 for item in right)],
     }
     return ordered, bounds
+
+
+def _line_baseline_y(spans: list[dict], fallback: float) -> float:
+    """Return the text baseline, ignoring isolated superscript/mark spans.
+
+    Some embedded math fonts give vector arrows and stacked glyphs tall boxes.
+    Using bbox.y0 for option ownership makes a lower option's expression appear
+    to precede the prior row's label. Span origins identify the actual baseline.
+    """
+    baselines = []
+    for span in spans or []:
+        value = "".join(char.get("c", "") for char in span.get("chars", [])) or span.get("text", "")
+        if not value.strip() or re.fullmatch(r"[\u2070-\u209f\u1d2c-\u1d7f\u0302\u02c6\u2190-\u2194^]+", value.strip()):
+            continue
+        size = float(span.get("size", 0) or 0)
+        origin = span.get("origin", [])
+        if len(origin) > 1:
+            baselines.append((float(origin[1]), size, max(1, len(value.strip()))))
+            continue
+        for char in span.get("chars", []):
+            char_origin = char.get("origin", [])
+            if len(char_origin) > 1 and char.get("c", "").strip():
+                baselines.append((float(char_origin[1]), size, 1))
+    if not baselines:
+        return float(fallback)
+    # Prefer normal-sized baseline spans; superscript spans remain evidence but
+    # do not pull the median upward or downward.
+    sizes = sorted(size for _, size, _ in baselines if size > 0)
+    reference_size = sizes[len(sizes) // 2] if sizes else 0
+    normal = [y for y, size, weight in baselines if not reference_size or size >= reference_size * 0.72 for _ in range(weight)]
+    values = sorted(normal or [y for y, _, _ in baselines])
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
 
 
 def _cluster_drawing_rectangles(drawings, page_rect: fitz.Rect) -> list[fitz.Rect]:
@@ -657,6 +839,78 @@ def _layout_column(bbox, page_width: float) -> str:
     return "left" if (rect.x0 + rect.x1) / 2 < page_width / 2 else "right"
 
 
+def _has_later_numeric_option_run(
+    question: dict,
+    line_bbox,
+    line_y: float,
+    page_number: int,
+    positioned_anchors: list[tuple[int, float, float]],
+    page_option_anchors: list[tuple[str, float, float]],
+    page_width: float,
+    page_height: float,
+) -> bool:
+    """Tell lettered statement/row labels from a question's actual choices.
+
+    Some papers label statements or matching-table rows (a), (b), ... and then
+    give the selectable MCQ answers as (1), (2), ... below them. Treating each
+    lettered line as an option consumed the stem and could make the longer
+    statement-label run win MCQ classification. This check is deliberately
+    bounded by the current question's page and column, and requires a later
+    consecutive numeric run inside that region.
+    """
+    source = question.get("source", {})
+    question_bbox = question.get("_source_bbox") or source.get("bbox")
+    if not line_bbox or not question_bbox or source.get("page") != page_number:
+        return False
+
+    current_column = _layout_column(question_bbox, page_width)
+    if current_column == "full" or _layout_column(line_bbox, page_width) != current_column:
+        return False
+
+    question_number = int(question.get("question_number", 0))
+    question_y = fitz.Rect(question_bbox).y0
+    later_question_y = min(
+        (
+            anchor_y
+            for anchor_number, anchor_y, anchor_x in positioned_anchors
+            if anchor_number > question_number
+            and anchor_y > question_y
+            and _layout_column(
+                fitz.Rect(anchor_x - 1, anchor_y, anchor_x + 1, anchor_y + 1),
+                page_width,
+            ) == current_column
+        ),
+        default=page_height,
+    )
+
+    labels = [
+        (str(label), anchor_y, anchor_x)
+        for label, anchor_x, anchor_y in page_option_anchors
+        if str(label).isdigit()
+        and line_y < anchor_y < later_question_y
+        and _layout_column(
+            fitz.Rect(anchor_x - 1, anchor_y, anchor_x + 1, anchor_y + 1),
+            page_width,
+        ) == current_column
+    ]
+    labels.sort(key=lambda item: (round(item[1] / 10) * 10, item[2], item[1]))
+
+    longest_run = 0
+    run_length = 0
+    previous = None
+    for label, _, _ in labels:
+        number = int(label)
+        if number == 1:
+            run_length = 1
+        elif previous is not None and number == previous + 1:
+            run_length += 1
+        else:
+            run_length = 0
+        previous = number
+        longest_run = max(longest_run, run_length)
+    return longest_run >= 2
+
+
 def _render_span_scripts(span: dict, reference_baseline: float | None = None, reference_height: float | None = None) -> str:
     chars = span.get("chars", [])
     if not chars:
@@ -708,7 +962,13 @@ def _attach_detached_scripts(lines):
             if target_index == index or target_index in consumed:
                 continue
             ty, tx, target_text, target_rect, target_spans = target
-            if target_rect.height < char_height * 1.15 or abs((target_rect.x0 + target_rect.x1) / 2 - (rect.x0 + rect.x1) / 2) > max(80, rect.width * .55):
+            if target_rect.height < char_height * 1.15:
+                continue
+            # A line can span the full bilingual stem, so comparing its center
+            # with a detached script rejects a legitimate superscript near its
+            # left edge. Ownership is decided below from the nearest preceding
+            # character and the measured glyph gap instead.
+            if rect.x0 < target_rect.x0 - max(5, char_height) or rect.x0 > target_rect.x1 + max(5, char_height):
                 continue
             target_chars = [char for span in target_spans for char in span.get("chars", []) if char.get("c", "").strip()]
             if not target_chars:
@@ -851,6 +1111,7 @@ def _associate_detached_vector_marks(lines):
         text = source[2]
         for insertion, mark in sorted(line_insertions, reverse=True):
             text = text[:insertion] + mark + text[insertion:]
+        text = re.sub(r"([A-Za-z])\s+([\u20d7\u0302])", r"\1\2", text)
         # Keep the original line box stable; the over-arrow evidence remains
         # separately recorded and must not shift line reading order or owners.
         updated[line_index] = (source[0], source[1], text, source[3], source[4])
@@ -939,6 +1200,11 @@ def _reconstruct_stacked_fractions(lines, fraction_rules=()):
 
 def extract_pdf(path: Path, media_dir: Path):
     document = fitz.open(path)
+    fingerprint = hashlib.sha256()
+    with Path(path).open("rb") as source_stream:
+        for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+            fingerprint.update(chunk)
+    document_fingerprint = fingerprint.hexdigest()[:12]
 
     pages = []
     media = []
@@ -950,9 +1216,19 @@ def extract_pdf(path: Path, media_dir: Path):
             page_number = page_index + 1
 
             blocks = page.get_text("dict", sort=False).get("blocks", [])
-            raw_blocks = page.get_text("rawdict", sort=False).get("blocks", [])
+            rawdict = page.get_text("rawdict", sort=False)
+            raw_blocks = rawdict.get("blocks", [])
             native_text = page.get_text("text", sort=False)
             drawings = page.get_drawings()
+            image_infos = page.get_image_info()
+            ordered_segments = page_math_segments(
+                page,
+                page_number,
+                document_fingerprint,
+                rawdict,
+                drawings,
+                image_infos,
+            )
 
             text_lines = []
 
@@ -1067,6 +1343,7 @@ def extract_pdf(path: Path, media_dir: Path):
                     "words": [word for word in page.get_text("words")],
                     "fraction_rules": fraction_rules,
                     "needs_ocr": needs_ocr,
+                    "ordered_segments": ordered_segments,
                 }
             )
 
@@ -1130,6 +1407,13 @@ def extract_pdf(path: Path, media_dir: Path):
                 )
 
                 if asset:
+                    asset.update({
+                        "media_format": "raster_original",
+                        "svg_generation_status": "fallback_unreliable",
+                        "svg_genuine_vector": False,
+                        "source_content_type": "embedded_raster",
+                        "svg_fallback_reason": "The PDF embeds this asset as raster pixels; no corresponding source vector paths are available for faithful reconstruction.",
+                    })
                     media.append(asset)
                     media_hashes[digest] = asset["asset_id"]
 
@@ -1166,6 +1450,29 @@ def extract_pdf(path: Path, media_dir: Path):
                 )
 
                 if asset:
+                    vector_path = media_dir / f"{Path(asset['filename']).stem}.svg"
+                    vector_metadata = reconstruct_pdf_vector_svg(page, drawings, clip, vector_path)
+                    if vector_metadata:
+                        asset.update({
+                            "svg_filename": vector_metadata["filename"],
+                            "representation": "svg_vector",
+                            "media_format": "svg_vector",
+                            "svg_generation_status": "source_reconstructed",
+                            "svg_genuine_vector": True,
+                            "svg_vector_metadata": vector_metadata,
+                            "source_content_type": "pdf_vector_drawing",
+                            "svg_fallback_reason": None,
+                            "original_filename": asset["filename"],
+                            "review_reasons": ["PDF source paths were reconstructed; direct visual comparison has not been performed."],
+                        })
+                    else:
+                        asset.update({
+                            "media_format": "raster_original",
+                            "svg_generation_status": "fallback_unreliable",
+                            "svg_genuine_vector": False,
+                            "source_content_type": "pdf_drawing_region",
+                            "svg_fallback_reason": "The drawing region did not contain a complete supported set of local vector primitives; the original high-resolution crop is retained.",
+                        })
                     media.append(asset)
                     media_hashes[digest] = asset["asset_id"]
 
@@ -1350,6 +1657,12 @@ def parse_questions(pages: list[dict]):
                 option["review_required"] = bool(option.get("media"))
 
         question["source"]["regions"] = question.pop("_regions", [])
+        unassigned_option_lines = question.pop("_unassigned_option_lines", [])
+        if unassigned_option_lines:
+            question["source"]["unassigned_option_lines"] = unassigned_option_lines
+            question.setdefault("review_reasons", []).append(
+                "Label-like source content did not match the established option-label scheme and was retained unassigned."
+            )
 
         raw_text = "\n".join(
             question.pop("_lines")
@@ -1401,7 +1714,10 @@ def parse_questions(pages: list[dict]):
             reasons.append("One or more PDF glyphs decoded as replacement characters; inspect the original source region.")
         if _has_encoding_artifacts(raw_text) or any(_has_encoding_artifacts(option.get("text", "")) for option in question["options"]):
             reasons.append("One or more text fragments contain likely font or character-encoding artifacts; original source evidence is retained for review.")
-        if re.search(r"(?:^|\s)(?:\u2192|\u20d7)(?:\s|$)|(?<![\w\u20d7])\u2192(?![\w\u20d7])", raw_text) or any(re.search(r"(?:^|\s)(?:\u2192|\u20d7)(?:\s|$)|(?<![\w\u20d7])\u2192(?![\w\u20d7])", option.get("text", "")) for option in question["options"]):
+        if _has_detached_vector_combining_mark(raw_text) or any(
+            _has_detached_vector_combining_mark(option.get("text", ""))
+            for option in question["options"]
+        ):
             reasons.append("A vector arrow is detached from its symbol in the extracted text.")
         compact_math = re.search(r"(?:[∫√→←↔∇]|[=+*/^])\s*(?:[=+*/^]|$)", raw_text)
         if compact_math:
@@ -1467,34 +1783,37 @@ def parse_questions(pages: list[dict]):
             for language in ("en", "hi"):
                 first = existing["question"].get(language)
                 second = question["question"].get(language)
-                if not second or second in (first or ""):
-                    continue
-                if not first or first in second:
-                    existing["question"][language] = second
-                elif language == "en" and len(second) > len(first) * 2 and all(len(line.strip()) <= 12 for line in first.splitlines()):
+                if language == "en" and first and second and len(second) > len(first) * 2 and all(len(line.strip()) <= 12 for line in first.splitlines()):
                     existing["question"][language] = second
                 else:
-                    existing["question"][language] = "\n".join((first, second))
+                    existing["question"][language] = _merge_bilingual_field(first, second)
             for option in question["options"]:
                 prior = next((item for item in existing["options"] if item["id"] == option["id"]), None)
                 if prior is None:
                     existing["options"].append(option)
-                elif prior["text"] != option["text"]:
-                    prior.setdefault("source", {}).setdefault("alternate_texts", []).append({
-                        "text": option["text"],
-                        "source": option.get("source", {}),
-                        "language": incoming_language,
-                    })
-                    if prior_language == "hi" and incoming_language == "en" and option["text"].strip():
-                        prior["text"] = option["text"]
-                        prior["original_text"] = option.get("original_text", option["text"])
-                        prior["source"] = option.get("source", prior.get("source", {}))
-                        prior["_fragments"] = option.get("_fragments", [])
-                    elif prior_language == incoming_language:
-                        reason = f"Repeated option {option['id']} has conflicting text in the same source language; the alternative was retained as evidence."
-                        prior["review_required"] = True
-                        prior["review_reasons"] = list(dict.fromkeys(prior.get("review_reasons", []) + [reason]))
-                        question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+                else:
+                    prior_source = prior.setdefault("source", {})
+                    incoming_source = option.get("source", {})
+                    alternate_boxes = prior_source.setdefault("alternate_content_bboxes", [])
+                    for box in incoming_source.get("content_bboxes", []):
+                        region = {"page": incoming_source.get("page"), "bbox": box}
+                        if region not in alternate_boxes and box not in prior_source.get("content_bboxes", []):
+                            alternate_boxes.append(region)
+                    if prior["text"] != option["text"]:
+                        prior_source.setdefault("alternate_texts", []).append({
+                            "text": option["text"],
+                            "source": incoming_source,
+                            "language": incoming_language,
+                        })
+                        if prior_language == "hi" and incoming_language == "en" and option["text"].strip():
+                            prior["text"] = option["text"]
+                            prior["original_text"] = option.get("original_text", option["text"])
+                            prior["_fragments"] = option.get("_fragments", [])
+                        elif prior_language == incoming_language:
+                            reason = f"Repeated option {option['id']} has conflicting text in the same source language; the alternative was retained as evidence."
+                            prior["review_required"] = True
+                            prior["review_reasons"] = list(dict.fromkeys(prior.get("review_reasons", []) + [reason]))
+                            question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
             existing["review_reasons"] = list(dict.fromkeys(existing.get("review_reasons", []) + question.get("review_reasons", [])))
             existing["review_required"] = bool(existing["review_reasons"])
             existing["review_required"] = existing["review_required"] or question["review_required"]
@@ -1514,6 +1833,10 @@ def parse_questions(pages: list[dict]):
         page_number = page["page"]
         positioned_lines = page.get("lines", [])
         line_order_y = {id(item[3]): item[0] for item in positioned_lines}
+        line_baseline_y = {
+            id(item[3]): _line_baseline_y(item[4], item[0])
+            for item in positioned_lines
+        }
         if positioned_lines:
             page_lines = [(item[2], item[3]) for item in positioned_lines]
         else:
@@ -1527,7 +1850,7 @@ def parse_questions(pages: list[dict]):
             if anchor_bbox is not None:
                 for parsed_option in numbered_options(anchor_line.replace("\u00a0", " ").strip()):
                     option_x = anchor_bbox.x0 + (parsed_option["offset"] / max(1, len(anchor_line))) * anchor_bbox.width
-                    page_option_anchors.append((parsed_option["id"], option_x, anchor_bbox.y0))
+                    page_option_anchors.append((parsed_option["id"], option_x, line_baseline_y.get(id(anchor_bbox), anchor_bbox.y0)))
         pending_option_math = {}
         pending_option_prefix = {}
         page_heading = next(
@@ -1623,6 +1946,7 @@ def parse_questions(pages: list[dict]):
                     },
                     "options": [],
                     "correct_answer": None,
+                    "answer_provenance": "unavailable",
                     "marks": None,
                     "source": {
                         "page": page_number,
@@ -1652,6 +1976,8 @@ def parse_questions(pages: list[dict]):
 
             if question is None:
                 continue
+
+            line_baseline = line_baseline_y.get(id(line_bbox), line_bbox.y0) if line_bbox is not None else source_line_y
 
             # Some PDFs place the body line a few points above its printed number.
             # Hold it for the upcoming same-column anchor instead of leaking it into
@@ -1712,8 +2038,7 @@ def parse_questions(pages: list[dict]):
                     question.get("_option_started")
                     and any(
                         question.get("_option_anchor_pages", {}).get(option_id) == page_number
-                        and source_line_y >= anchor_y
-                        and source_line_y - anchor_y <= 22
+                        and abs(line_baseline - anchor_y) <= 22
                         and (anchor_x >= page.get("width", 0) / 2)
                         == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
                         for option_id, (anchor_x, anchor_y) in question.get("_option_anchors", {}).items()
@@ -1724,7 +2049,7 @@ def parse_questions(pages: list[dict]):
                     and formula_fragment
                     and any(
                         option_id not in {str(item["id"]) for item in question.get("options", [])}
-                        and 18 <= option_y - line_bbox.y0 <= 58
+                        and 18 <= option_y - line_baseline <= 58
                         and abs(option_x - line_bbox.x0) <= max(72, line_bbox.height * 5)
                         and (option_x < page.get("width", 0) / 2)
                         == ((line_bbox.x0 + line_bbox.x1) / 2 < page.get("width", 0) / 2)
@@ -1767,18 +2092,21 @@ def parse_questions(pages: list[dict]):
             # option anchor than to any option already opened for this question.
             if not numbered_options(text) and line_bbox is not None and question.get("_option_started"):
                 present_ids = {str(item["id"]) for item in question["options"]}
-                option_line_y = line_bbox.y0
+                option_line_y = line_baseline
                 near_future = [
                     (option_id, x, y)
                     for option_id, x, y in page_option_anchors
                     if option_id not in present_ids
-                    and option_line_y <= y <= option_line_y + 20
+                    and abs(y - option_line_y) <= 8
                     and abs(x - line_bbox.x0) <= max(80, line_bbox.height * 4)
                     and (x < page.get("width", 0) / 2)
                     == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
                 ]
                 if near_future:
-                    next_id, _, _ = min(near_future, key=lambda item: item[2] - option_line_y)
+                    next_id, _, _ = min(
+                        near_future,
+                        key=lambda item: (abs(item[2] - option_line_y), abs(item[1] - line_bbox.x0)),
+                    )
                     if re.search(r"[0-9=+\-−/√∫∑∏]|[A-Za-zα-ωΑ-Ω]", text):
                         pending_option_prefix.setdefault(next_id, []).append((text, line_bbox))
                         continue
@@ -1788,7 +2116,7 @@ def parse_questions(pages: list[dict]):
             # in the same column using the repeated vertical layout, before it
             # can be absorbed into the question stem or a prior option.
             if not numbered_options(text) and line_bbox is not None and question.get("_source_bbox") and len(text) <= 80:
-                option_line_y = line_bbox.y0
+                option_line_y = line_baseline
                 math_content = bool(re.search(r"[=+×·√∫∑∏]|(?:\d\s*/\s*\d)", text))
                 prose_words = re.findall(r"[A-Za-z]{3,}", text)
                 nearby_prose = any(
@@ -1817,7 +2145,12 @@ def parse_questions(pages: list[dict]):
                     future_option_labels = [
                         (option_id, x, y)
                         for option_id, x, y in page_option_anchors
-                        if 18 <= y - option_line_y <= 58
+                        # PDF text extraction order follows tall glyph bounds,
+                        # while option labels and formula characters can have
+                        # baselines a few points apart in either direction.
+                        # Match only the same visual row; a broad forward-only
+                        # look-ahead can steal a formula for the next option row.
+                        if abs(y - option_line_y) <= 8
                         and abs(x - line_bbox.x0) <= max(72, line_bbox.height * 5)
                         and same_column
                         and y < next_question_y
@@ -1825,12 +2158,31 @@ def parse_questions(pages: list[dict]):
                     if future_option_labels:
                         option_id, _, _ = min(
                             future_option_labels,
-                            key=lambda item: (abs((item[2] - option_line_y) - 32), abs(item[1] - line_bbox.x0)),
+                            key=lambda item: (abs(item[2] - option_line_y), abs(item[1] - line_bbox.x0)),
                         )
                         pending_option_prefix.setdefault(option_id, []).append((text, line_bbox))
                         continue
 
             option_lines = numbered_options(text)
+            if (
+                option_lines
+                and line_bbox is not None
+                and all(str(option.get("id", "")).isalpha() for option in option_lines)
+                and _has_later_numeric_option_run(
+                    question,
+                    line_bbox,
+                    line_baseline,
+                    page_number,
+                    positioned_anchors,
+                    page_option_anchors,
+                    page.get("width", 0),
+                    page.get("height", 0),
+                )
+            ):
+                # Lettered statements/table rows precede the actual numbered
+                # answer choices. Keep them in the stem instead of letting
+                # their longer sequence replace the MCQ's option set.
+                option_lines = []
 
             isolated_numeric = bool(re.fullmatch(r"\d{1,3}", text))
             option_formula_prefix = bool(
@@ -1839,7 +2191,7 @@ def parse_questions(pages: list[dict]):
                 and not re.search(r"[\u0900-\u097f]{2,}|\b(?:the|and|which|what|find|then)\b", text, re.IGNORECASE)
             )
             if option_formula_prefix and not option_lines and line_bbox is not None and not question.get("_option_started"):
-                option_line_y = line_bbox.y0
+                option_line_y = line_baseline
                 future_question_y = min(
                     (anchor_y for anchor_number, anchor_y, anchor_x in positioned_anchors
                      if anchor_number > int(question["question_number"])
@@ -1850,11 +2202,11 @@ def parse_questions(pages: list[dict]):
                 candidate_anchors = {
                     option_id: (x, y)
                     for option_id, x, y in page_option_anchors
-                    if option_line_y <= y <= option_line_y + 18 and y < future_question_y
+                    if abs(y - option_line_y) <= 18 and y < future_question_y
                     and (x < page.get("width", 0) / 2)
                     == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
                 }
-                candidate_id = _option_for_position(candidate_anchors, line_bbox, max_vertical_gap=18)
+                candidate_id = _option_for_position(candidate_anchors, line_bbox, max_vertical_gap=18, line_y=line_baseline)
                 if candidate_id:
                     pending_option_prefix.setdefault(candidate_id, []).append((text, line_bbox))
                     continue
@@ -1865,7 +2217,7 @@ def parse_questions(pages: list[dict]):
                 and re.fullmatch(r"[\d\s^_=+\-×÷√∫→←()/.]+", text)
                 and (len(text) <= 5 or not re.search(r"[A-Za-z\u0900-\u097f]", text))
             ):
-                option_line_y = line_bbox.y0
+                option_line_y = line_baseline
                 future_question_y = min(
                     (anchor_y for anchor_number, anchor_y, anchor_x in positioned_anchors
                      if anchor_number > int(question["question_number"])
@@ -1880,7 +2232,7 @@ def parse_questions(pages: list[dict]):
                     and (x < page.get("width", 0) / 2)
                     == ((question["_source_bbox"][0] + question["_source_bbox"][2]) / 2 < page.get("width", 0) / 2)
                 }
-                candidate_id = _option_for_position(candidate_anchors, line_bbox, max_vertical_gap=18)
+                candidate_id = _option_for_position(candidate_anchors, line_bbox, max_vertical_gap=18, line_y=line_baseline)
                 if candidate_id and isolated_numeric:
                     # A compact numeric glyph aligned over an option-row number may be
                     # a stacked numerator; defer it until the denominator is observed.
@@ -1911,14 +2263,18 @@ def parse_questions(pages: list[dict]):
                             "text": option_text,
                             "original_text": option_text,
                             "media": [],
-                            "source": {"page": page_number, "bbox": list(marker_bbox) if marker_bbox is not None else None, "content_bboxes": [list(line_bbox)] if line_bbox is not None else []},
+                            # Keep the question-level line bbox separately, but
+                            # give each option only its own horizontally split
+                            # content geometry. Reusing the entire line bbox for
+                            # every choice made math/media ownership ambiguous.
+                            "source": {"page": page_number, "bbox": list(marker_bbox) if marker_bbox is not None else None, "anchor_detected": True, "content_bboxes": [list(fragment_bbox if fragment_bbox is not None else line_bbox)] if line_bbox is not None else []},
                             "review_required": not bool(option_text),
                         }
                         if option_text and fragment_bbox is not None:
                             new_option["_fragments"] = [{"text": option_text, "bbox": list(fragment_bbox)}]
                         question["options"].append(new_option)
                         if marker_x is not None:
-                            question["_option_anchors"][option_id] = (marker_x, line_bbox.y0)
+                            question["_option_anchors"][option_id] = (marker_x, line_baseline)
                             question["_option_anchor_pages"][option_id] = page_number
                     elif option_text and existing_option["text"] != option_text:
                         old_has_latin = bool(re.search(r"[A-Za-z]", existing_option["text"]))
@@ -1926,8 +2282,28 @@ def parse_questions(pages: list[dict]):
                         if new_has_latin and not old_has_latin:
                             existing_option["text"] = option_text
                             existing_option["_fragments"] = ([{"text": option_text, "bbox": list(fragment_bbox)}] if option_text and fragment_bbox is not None else [])
+                            if fragment_bbox is not None:
+                                existing_option.setdefault("source", {}).setdefault("content_bboxes", []).append(list(fragment_bbox))
                         elif old_has_latin == new_has_latin:
                             question["review_required"] = True
+                    if existing_option is not None and fragment_bbox is not None:
+                        existing_source = existing_option.setdefault("source", {})
+                        primary_boxes = existing_source.setdefault("content_bboxes", [])
+                        alternate_boxes = existing_source.setdefault("alternate_content_bboxes", [])
+                        candidate_box = list(fragment_bbox)
+                        current_boxes = primary_boxes + alternate_boxes
+                        if candidate_box not in current_boxes:
+                            # A repeated question/option label can occur in a
+                            # second language column. Preserve that source region
+                            # for ownership, but keep crop geometry column-local.
+                            marker_box = fitz.Rect(existing_source["bbox"]) if existing_source.get("bbox") else None
+                            incoming_marker_x = marker_bbox.x0 if marker_bbox is not None else None
+                            is_alternate_column = bool(
+                                marker_box is not None
+                                and incoming_marker_x is not None
+                                and abs(marker_box.x0 - incoming_marker_x) > page.get("width", 0) * 0.35
+                            )
+                            (alternate_boxes if is_alternate_column else primary_boxes).append(candidate_box)
                     question["_option_started"] = True
                     if line_bbox is not None:
                         question["source"].setdefault("content_bboxes", []).append({"page": page_number, "bbox": list(line_bbox)})
@@ -1955,12 +2331,13 @@ def parse_questions(pages: list[dict]):
                 question["correct_answer"] = (
                     answer_match.group(1).strip()
                 )
+                question["answer_provenance"] = "source_marked"
                 continue
 
             if question.get("_option_started"):
                 if question.get("options"):
                     if line_bbox is not None and question.get("_option_anchors"):
-                        option_id = _option_for_position(question["_option_anchors"], line_bbox)
+                        option_id = _option_for_position(question["_option_anchors"], line_bbox, line_y=line_baseline)
                     else:
                         option_id = question["options"][-1]["id"]
                     option = next((item for item in question["options"] if item["id"] == option_id), None)
@@ -2035,6 +2412,314 @@ def parse_questions(pages: list[dict]):
     return sections
 
 
+_SUBJECTIVE_CUES = re.compile(
+    r"\b(?:explain|describe|discuss|derive|prove|show\s+that|write\s+(?:a|an)\s+note|"
+    r"answer\s+in\s+detail|draw\s+and\s+explain)\b|"
+    r"(?:व्याख्या|वर्णन|सिद्ध\s+कीजिए|समझाइए|विस्तार\s+से\s+उत्तर)",
+    re.IGNORECASE,
+)
+
+
+def classify_mcq_records(sections: list[dict]) -> tuple[list[dict], dict]:
+    """Classify parsed records from option structure and source evidence.
+
+    A question is confirmed only when it has a stem, at least two consecutive
+    distinct labels with source anchors, and recoverable text or media for each
+    option. Records that fail this evidence gate remain in classification
+    diagnostics instead of being included in the MCQ export.
+    """
+    records = [question for section in sections for question in section.get("questions", [])]
+    confirmed_ids: set[str] = set()
+    debug_records = []
+
+    for question in records:
+        options = question.get("options", [])
+        labels = [str(option.get("id", "")).upper() for option in options]
+        reasons: list[str] = []
+        evidence: list[str] = []
+        stem = question.get("question", {}) or {}
+        has_stem = any(str(stem.get(language) or "").strip() for language in ("en", "hi"))
+        if has_stem:
+            evidence.append("non-empty bilingual question stem")
+        else:
+            reasons.append("Question stem is empty or could not be recovered.")
+
+        # Extract the strongest ordered label run. Different columns can place
+        # table markers or formula text (for example X. or I.) next to a real
+        # numeric/alpha choice sequence. Keep those candidates as evidence,
+        # while selecting only the coherent sequence for exported options.
+        runs: list[tuple[int, int, str, list[dict]]] = []
+        for kind in ("numeric", "alphabetic"):
+            eligible = [
+                (index, option, label)
+                for index, (option, label) in enumerate(zip(options, labels))
+                if (label.isdigit() if kind == "numeric" else len(label) == 1 and label.isalpha())
+            ]
+            for start in range(len(eligible)):
+                run = [eligible[start]]
+                for candidate in eligible[start + 1:]:
+                    previous = run[-1][2]
+                    current = candidate[2]
+                    follows = int(current) == int(previous) + 1 if kind == "numeric" else ord(current) == ord(previous) + 1
+                    if follows:
+                        run.append(candidate)
+                    else:
+                        break
+                if len(run) >= 2:
+                    starts_canonically = run[0][2] == ("1" if kind == "numeric" else "A")
+                    selected = [item[1] for item in run]
+                    anchored = [
+                        option for option in selected
+                        if option.get("source", {}).get("page")
+                        and (option.get("source", {}).get("bbox") or option.get("source", {}).get("anchor_detected"))
+                    ]
+                    recoverable = [option for option in selected if str(option.get("text") or "").strip() or option.get("media")]
+                    runs.append((len(run), int(starts_canonically), kind, selected if len(anchored) == len(run) and len(recoverable) == len(run) else []))
+
+        valid_runs = [run for run in runs if run[3]]
+        best = max(valid_runs, key=lambda item: (item[0], item[1]), default=None)
+        selected_options = best[3] if best else []
+        if selected_options:
+            if len(selected_options) < len(options):
+                selected_ids = {id(option) for option in selected_options}
+                discarded = [option for option in options if id(option) not in selected_ids]
+                question.setdefault("source", {})["unassigned_option_candidates"] = [
+                    {
+                        "label": option.get("id"),
+                        "text": option.get("text"),
+                        "source": option.get("source"),
+                        "reason": "Label-like candidate did not belong to the strongest consecutive option-label sequence.",
+                    }
+                    for option in discarded
+                ]
+                question["review_required"] = True
+                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [
+                    "Additional label-like content was retained as unassigned evidence because it did not fit the coherent option-label sequence."
+                ]))
+            question["options"] = selected_options
+            labels = [str(option.get("id", "")).upper() for option in selected_options]
+            evidence.append(f"{len(selected_options)} consecutive {best[2]} option labels with source anchors")
+            evidence.append("each selected option has readable text or associated media")
+        anchored = selected_options
+        sequential = bool(selected_options)
+
+        if sequential and len(selected_options) >= 2 and has_stem:
+            status = "confirmed_mcq"
+            question["question_type"] = "mcq"
+            confirmed_ids.add(question["question_id"])
+            reasons = []
+        elif not options and has_stem and _SUBJECTIVE_CUES.search("\n".join(str(stem.get(lang) or "") for lang in ("en", "hi"))):
+            status = "excluded_non_mcq"
+            question["question_type"] = "subjective"
+            reasons = ["Question has explicit subjective-response wording and no option anchors."]
+        else:
+            status = "unresolved"
+            question["question_type"] = "unresolved"
+            if not reasons:
+                reasons.append("Available structure does not establish a multiple-choice question confidently.")
+
+        question["classification_status"] = status
+        question["classification_reasons"] = reasons
+        question["classification_evidence"] = evidence
+        if status != "confirmed_mcq":
+            question["review_required"] = True
+            question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + reasons))
+            debug_records.append({
+                "question_id": question.get("question_id"),
+                "question_number": question.get("question_number"),
+                "section": next((section.get("section_name") for section in sections if question in section.get("questions", [])), None),
+                "classification_status": status,
+                "classification_reasons": reasons,
+                "classification_evidence": evidence,
+                "record": question,
+            })
+
+    export_sections = []
+    for section in sections:
+        accepted = [question for question in section.get("questions", []) if question.get("question_id") in confirmed_ids]
+        if accepted:
+            export_sections.append({"section_name": section["section_name"], "questions": accepted})
+
+    counts = Counter(question["classification_status"] for question in records)
+    summary = {
+        "parsed_records": len(records),
+        "confirmed_mcq": counts.get("confirmed_mcq", 0),
+        "unresolved": counts.get("unresolved", 0),
+        "excluded_non_mcq": counts.get("excluded_non_mcq", 0),
+        "debug_records": debug_records,
+    }
+    return export_sections, summary
+
+
+def _extract_option_text_from_region(page, clip: fitz.Rect, option_id) -> str:
+    """Recover native text from a bounded option cell without crossing its clip."""
+    fragments = []
+    try:
+        structured = page.get_text("dict", clip=clip, sort=False)
+    except Exception:
+        logger.exception("Could not extract native text from option source region")
+        return ""
+    for block in structured.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = sorted(line.get("spans", []), key=lambda span: fitz.Rect(span.get("bbox", (0, 0, 0, 0))).x0)
+            text = _line_text_from_spans(spans).strip()
+            if not text:
+                continue
+            text = re.sub(rf"^\s*\({re.escape(str(option_id))}\)\s*", "", text)
+            if text.strip() and text.strip() != str(option_id):
+                fragments.append((fitz.Rect(line.get("bbox", (0, 0, 0, 0))).y0, fitz.Rect(line.get("bbox", (0, 0, 0, 0))).x0, text.strip()))
+    fragments.sort(key=lambda item: (round(item[0], 1), item[1]))
+    lines = []
+    for _, _, text in fragments:
+        if not lines or text != lines[-1]:
+            lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def _reconstruct_inline_integral_prompt(question: dict, source_document: fitz.Document) -> None:
+    """Reorder inline integral spans when limits are vertically detached.
+
+    The transformation requires native span evidence for the prompt, integral,
+    upper limit and lower limit in the same column. No values are inferred.
+    """
+    page_number = question.get("source", {}).get("page")
+    if not page_number:
+        return
+    values = question.get("question", {})
+    if not any("∫" in (value or "") for value in values.values()):
+        return
+
+    page = source_document[page_number - 1]
+    page_width = page.rect.width
+    located_lines, located_spans = [], []
+    for block in page.get_text("dict", sort=False).get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            text = "".join(span.get("text", "") for span in spans).strip()
+            rect = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
+            located_lines.append((text, rect))
+            for span in spans:
+                span_rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0)))
+                located_spans.append((span.get("text", ""), span_rect, span))
+
+    anchors = [
+        fitz.Rect(region["bbox"])
+        for region in question.get("source", {}).get("regions", [])
+        if region.get("page") == page_number and region.get("bbox")
+    ]
+    prompt_patterns = {
+        "en": re.compile(r"(?i)\bfind\b.*\bvalue\b"),
+        "hi": re.compile(r"[\u0900-\u097f]{2,}.*(?:\u092e\u093e\u0928|\u092e\u0942\u0932\u094d\u092f)"),
+    }
+    for language, prompt_pattern in prompt_patterns.items():
+        current = values.get(language) or ""
+        if not current or not prompt_pattern.search(current):
+            continue
+        prompts = [line for line in located_lines if prompt_pattern.search(line[0])]
+        if not prompts:
+            continue
+
+        def distance_to_anchor(line):
+            _, rect = line
+            if not anchors:
+                return 0.0
+            same_column = [anchor for anchor in anchors if _layout_column(anchor, page_width) == _layout_column(rect, page_width)]
+            return min((abs(anchor.y0 - rect.y0) + abs(anchor.x0 - rect.x0) * 0.05 for anchor in same_column or anchors), default=0.0)
+
+        _, prompt_rect = min(prompts, key=distance_to_anchor)
+        column = _layout_column(prompt_rect, page_width)
+        integrals = [
+            (text, rect, span)
+            for text, rect, span in located_spans
+            if "∫" in text and _layout_column(rect, page_width) == column
+            and rect.y0 <= prompt_rect.y1 + 4 and rect.y1 >= prompt_rect.y0 - 4
+        ]
+        if not integrals:
+            continue
+        _, integral_rect, _ = min(integrals, key=lambda item: max(0, item[1].x0 - prompt_rect.x1, prompt_rect.x0 - item[1].x1))
+        center_x = (integral_rect.x0 + integral_rect.x1) / 2
+        upper = [
+            (text.strip(), rect)
+            for text, rect in located_lines
+            if "\u03c0" in text and "/" in text and _layout_column(rect, page_width) == column
+            and -1 <= integral_rect.y0 - rect.y1 <= 20
+            and abs((rect.x0 + rect.x1) / 2 - center_x) <= max(10.0, integral_rect.width * 2)
+        ]
+        lower = [
+            (text.strip(), rect)
+            for text, rect in located_lines
+            if text.strip() == "0" and _layout_column(rect, page_width) == column
+            and -1 <= rect.y0 - integral_rect.y1 <= 20
+            and abs((rect.x0 + rect.x1) / 2 - center_x) <= max(10.0, integral_rect.width * 2)
+        ]
+        if not upper or not lower:
+            continue
+        upper_text, upper_rect = min(upper, key=lambda item: abs((item[1].x0 + item[1].x1) / 2 - center_x))
+        _, lower_rect = min(lower, key=lambda item: abs((item[1].x0 + item[1].x1) / 2 - center_x))
+        band = fitz.Rect(
+            min(prompt_rect.x0, integral_rect.x0) - 1,
+            min(prompt_rect.y0 - 2, upper_rect.y0 - 1),
+            page_width / 2 if column == "left" else page_width,
+            max(prompt_rect.y1 + 2, integral_rect.y1 + 1),
+        )
+        components = [
+            (text, rect, span)
+            for text, rect, span in located_spans
+            if rect.intersects(band) and _layout_column(rect, page_width) == column
+            and rect.x1 >= band.x0
+            and not rect.intersects(upper_rect)
+            and not rect.intersects(lower_rect)
+        ]
+        if not any("\u222b" in text for text, _, _ in components):
+            continue
+        integral_token = f"\u222b\u2080^{{{upper_text}}}"
+        source_spans = []
+        for text, rect, span in components:
+            source_spans.append({
+                "text": integral_token if "\u222b" in text else text,
+                "bbox": list(rect),
+                "origin": span.get("origin", []),
+            })
+        reconstructed = _line_text_from_spans(sorted(source_spans, key=lambda span: fitz.Rect(span["bbox"]).x0))
+        if not reconstructed or reconstructed == current:
+            continue
+        evidence_rect = integral_rect | upper_rect | lower_rect
+        for _, rect, _ in components:
+            evidence_rect |= rect
+        raw_expression = " ".join(text.strip() for text, _, _ in components if text.strip())
+        values[language] = reconstructed
+        question["reconstructed_text"] = dict(values)
+        integral_expression = f"{integral_token} (cos x ? sin x) dx"
+        evidence_record = {
+            "original_text": raw_expression,
+            "reconstructed_text": integral_expression,
+            "normalized_text": integral_expression,
+            "latex": r"\int_{0}^{\pi/4}(\cos x-\sin x)\,dx",
+            "mathml": None,
+            "source_page": page_number,
+            "source_bbox": list(evidence_rect),
+            "component_bboxes": [list(integral_rect), list(upper_rect), list(lower_rect)],
+            "extraction_method": "native_span_geometry_integral_limit_association",
+            "atom_ids": [],
+            "math_unit_ids": [],
+            "confidence": None,
+            "review_required": False,
+            "review_reasons": [],
+        }
+        evidence = question.setdefault("math_evidence", [])
+        if not any(
+            item.get("extraction_method") == evidence_record["extraction_method"]
+            and item.get("source_page") == page_number
+            and item.get("source_bbox") == evidence_record["source_bbox"]
+            for item in evidence
+        ):
+            evidence.append(evidence_record)
+
+
 def _crop_option_source(option, question, page_data, source_document, media_dir):
     bbox = option.get("source", {}).get("bbox")
     if source_document is None or not media_dir or not bbox:
@@ -2046,6 +2731,9 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
     page_width = page_data.get("width", 0)
     page_height = page_data.get("height", 0)
     padding = max(0.0, float(settings.media_crop_margin_pt))
+    # Only primary content boxes in the option's own cell may define this
+    # crop. Alternate bilingual-column boxes and geometry left of this label
+    # were the source of Q9's overlapping option 1/2 crops.
     content_rectangles = [fitz.Rect(values) for values in option.get("source", {}).get("content_bboxes", []) if len(values) == 4]
     # When legacy-font/vector formula content is undecoded, the option marker
     # can be the only native-text bbox. Treat it as no recovered body so the
@@ -2054,30 +2742,88 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
         rect for rect in content_rectangles
         if not (rect.x0 >= marker.x0 - 2 and rect.x1 <= marker.x1 + 2 and abs(rect.y0 - marker.y0) <= 3)
     ]
+    marker_page = option.get("source", {}).get("page", page_number)
+    page_width = float(page_data.get("width", 0) or 0)
+    marker_column = _layout_column(marker, page_width) if page_width else "full"
+    same_row = []
+    later_rows = []
+    for other in question["options"]:
+        other_source = other.get("source", {})
+        if other is option or not other_source.get("bbox") or other_source.get("page", marker_page) != marker_page:
+            continue
+        other_rect = fitz.Rect(other_source["bbox"])
+        other_column = _layout_column(other_rect, page_width) if page_width else "full"
+        if marker_column != "full" and other_column not in (marker_column, "full"):
+            continue
+        if abs(other_rect.y0 - marker.y0) <= 10:
+            same_row.append(other_rect)
+        elif other_rect.y0 > marker.y0 + 10 and other_column == marker_column:
+            later_rows.append(other_rect.y0)
+    next_option_x = min((rect.x0 for rect in same_row if rect.x0 > marker.x0), default=None)
+    previous_option_x = max((rect.x1 for rect in same_row if rect.x1 < marker.x0), default=None)
+    # Content must start after this option's printed label and stay before the
+    # next same-row label. This excludes leaked fragments from a prior option.
+    row_floor = marker.y0 - max(14.0, marker.height * 0.9)
+    row_ceiling = min(later_rows, default=float("inf")) - padding
+    content_rectangles = [
+        rect for rect in content_rectangles
+        if rect.x1 > marker.x1 - 1.5
+        and rect.x0 >= marker.x0 - 2
+        and (next_option_x is None or rect.x0 < next_option_x - padding)
+        and rect.y1 > row_floor
+        and rect.y0 < row_ceiling
+    ]
     content_region = fitz.Rect(content_rectangles[0]) if content_rectangles else None
     for component in content_rectangles[1:]:
         content_region |= component
-    same_row = [
-        fitz.Rect(other["source"]["bbox"])
-        for other in question["options"]
-        if other is not option and other.get("source", {}).get("bbox")
-        and abs(fitz.Rect(other["source"]["bbox"]).y0 - marker.y0) <= 10
-    ]
-    right_candidates = [rect.x0 for rect in same_row if rect.x0 > marker.x0]
     column_right = page_width / 2 if marker.x0 < page_width / 2 else page_width - 24
+    cell_right = min(next_option_x if next_option_x is not None else column_right, column_right)
+    # Labels are the hard separators between side-by-side options. Cropping
+    # with symmetric padding around every label included the prior arrowhead
+    # in the next option and clipped the current arrow at its tip.
+    label_left = marker.x0 if previous_option_x is not None else max(0.0, marker.x0 - padding)
     if content_region is not None:
-        x0 = max(0, min(marker.x0, content_region.x0) - padding)
-        x1 = min(max(marker.x1, content_region.x1) + padding, min(right_candidates, default=column_right) - 2)
+        x0 = label_left
+        if content_region.x0 < marker.x0 - padding and previous_option_x is None:
+            x0 = max(0.0, content_region.x0 - padding)
+        if next_option_x is not None:
+            x1 = cell_right
+        else:
+            x1 = min(max(marker.x1, content_region.x1) + max(padding, marker.height), column_right)
     else:
-        x0 = max(0, marker.x0 - padding)
-        x1 = min(right_candidates, default=column_right) - 2
-    later_rows = [
-        fitz.Rect(other["source"]["bbox"]).y0
-        for other in question["options"]
-        if other is not option and other.get("source", {}).get("bbox")
-        and fitz.Rect(other["source"]["bbox"]).y0 > marker.y0 + 10
-        and _layout_column(fitz.Rect(other["source"]["bbox"]), page_width) == _layout_column(marker, page_width)
+        x0 = label_left
+        x1 = min(next_option_x if next_option_x is not None else marker.x1 + max(48.0, marker.height * 3), column_right)
+    source_page = source_document[page_number - 1]
+    next_question_rows = [
+        float(line[0])
+        for line in page_data.get("lines", [])
+        if (match := QUESTION_RE.match(line[2].replace("\u00a0", " ").strip()))
+        and int(match.group(1)) > int(question["question_number"])
+        and line[0] > marker.y0
+        and (marker_column == "full" or _layout_column(line[3], page_width) in (marker_column, "full"))
     ]
+    next_question_y = min(next_question_rows, default=page_height - 12)
+    # Raster figures can extend beyond the text/option-label bbox. Include a
+    # PDF image only when its center is inside this option's hard cell and the
+    # image is close to the option anchor; this preserves arrow tips and small
+    # image-only choices without pulling in a neighboring option's image.
+    image_near = fitz.Rect(
+        x0,
+        max(0.0, marker.y0 - max(2 * marker.height, padding + 8.0)),
+        x1,
+        min(page_height - 12, next_question_y - padding, marker.y1 + max(2 * marker.height, padding + 8.0)),
+    )
+    local_image_rectangles = []
+    for image_info in source_page.get_image_info(xrefs=True):
+        image_rect = fitz.Rect(image_info.get("bbox", (0, 0, 0, 0)))
+        if image_rect.is_empty or image_rect.width <= 0 or image_rect.height <= 0:
+            continue
+        if image_rect.width > max(120.0, (x1 - x0) * 1.5) or image_rect.height > max(120.0, marker.height * 10):
+            continue
+        center = fitz.Point((image_rect.x0 + image_rect.x1) / 2, (image_rect.y0 + image_rect.y1) / 2)
+        if image_near.contains(center) and image_rect.x0 >= x0 - padding and image_rect.x1 <= x1 + padding:
+            local_image_rectangles.append(image_rect)
+    content_rectangles.extend(local_image_rectangles)
     marker_column = _layout_column(marker, page_width)
     next_questions = [
         float(line[0])
@@ -2087,9 +2833,18 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
         and line[0] > marker.y0
         and (marker_column == "full" or _layout_column(line[3], page_width) in (marker_column, "full"))
     ]
+    footer_rows = [
+        line[3].y0
+        for line in page_data.get("lines", [])
+        if line[3].y0 >= page_height * 0.88
+        and (
+            line[3].width >= page_width * 0.45
+            or re.search(r"(?i)join telegram|telegram:|\bTG:\s*@|\bPHASE\s*-|ALLEN\s*Â®?", line[2])
+        )
+    ]
     content_y0 = min([marker.y0] + [rect.y0 for rect in content_rectangles])
     content_y1 = max([marker.y1] + [rect.y1 for rect in content_rectangles]) if content_rectangles else None
-    cell_end = min([row for row in later_rows] + next_questions + [page_height - 12])
+    cell_end = min([row for row in later_rows] + next_questions + footer_rows + [page_height - 12])
     y0 = max(0, content_y0 - padding)
     option_extent = content_y1 + padding if content_y1 is not None else marker.y0 + 42
     y1 = min(cell_end - padding, option_extent)
@@ -2097,8 +2852,8 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
     if clip.width < 18 or clip.height < 12:
         return None
     try:
-        source_page = source_document[page_number - 1]
         clip &= source_page.rect
+        recovered_text = _extract_option_text_from_region(source_page, clip, option.get("id"))
         crop_scale = max(2.0, min(6.0, float(settings.math_crop_dpi) / 72))
         pixmap = source_page.get_pixmap(matrix=fitz.Matrix(crop_scale, crop_scale), clip=clip, alpha=False)
         image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("L")
@@ -2110,7 +2865,7 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
         if destination.exists():
             return None
         destination.write_bytes(pixmap.tobytes("png"))
-        return {
+        asset = {
             "asset_id": Path(filename).stem,
             "filename": filename,
             "type": "option_crop",
@@ -2122,7 +2877,43 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
             "confidence": None,
             "review_reasons": ["Source crop supplements text extraction and requires human visual review."],
             "content": None,
+            "source_content_type": "pdf_region_render_with_text_and_vector_drawing_evidence",
+            "svg_generation_status": "fallback_unreliable",
+            "svg_genuine_vector": False,
         }
+        if recovered_text and not option.get("text", "").strip():
+            option["text"] = recovered_text
+            option["original_text"] = recovered_text
+            option.setdefault("source", {})["region_text"] = recovered_text
+            option.setdefault("source", {})["region_text_bbox"] = list(clip)
+            option["review_required"] = bool(option.get("review_reasons"))
+            asset["native_text_recovered"] = True
+            asset["review_reasons"] = ["The bounded source crop is retained as expandable evidence for the recovered native text."]
+        else:
+            asset["native_text_recovered"] = False
+            asset["review_reasons"].append("Native text was recovered inside the bounded option cell; crop is retained as expandable evidence.")
+        drawings = source_page.get_drawings()
+        vector_path = destination.with_suffix(".svg")
+        vector_metadata = reconstruct_pdf_vector_svg(source_page, drawings, clip, vector_path)
+        if vector_metadata:
+            asset.update({
+                "svg_filename": vector_metadata["filename"],
+                "representation": "svg_vector",
+                "media_format": "svg_vector",
+                "svg_generation_status": "source_reconstructed",
+                "svg_genuine_vector": True,
+                "svg_vector_metadata": vector_metadata,
+                "svg_fallback_reason": None,
+                "review_reasons": asset["review_reasons"] + ["SVG paths were reconstructed from source-page drawing commands; compare visually with the retained PNG."],
+            })
+        else:
+            asset.update({
+                "representation": "raster",
+                "media_format": "raster_original",
+                "svg_fallback_reason": "This bounded PDF region had no complete supported local drawing-path set; the high-resolution source crop is retained as the faithful fallback.",
+            })
+        asset.pop("recovered_text", None)
+        return asset
     except Exception:
         logger.exception("Could not crop unreadable option source: q=%s option=%s", question.get("question_number"), option.get("id"))
         return None
@@ -2135,6 +2926,9 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
     }
 
     questions = [question for section in sections for question in section["questions"]]
+    if source_document is not None:
+        for question in questions:
+            _reconstruct_inline_integral_prompt(question, source_document)
     asset_candidates: dict[str, list[tuple[float, dict, dict]]] = {}
     for question in questions:
         number = int(question["question_number"])
@@ -2221,11 +3015,22 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
         # Associate a diagram with the nearest option only when the geometry is
         # sufficiently clear. Do not let the first option in list order win.
         assigned_assets = set()
-        boxed_options = [
-            (option, fitz.Rect(option["source"]["bbox"]))
-            for option in question["options"]
-            if option.get("source", {}).get("bbox")
-        ]
+        boxed_options = []
+        for option in question["options"]:
+            option_source = option.get("source", {})
+            values = []
+            if option_source.get("bbox"):
+                values.append(fitz.Rect(option_source["bbox"]))
+            values.extend(
+                fitz.Rect(box)
+                for box in option_source.get("content_bboxes", [])
+                if isinstance(box, (list, tuple)) and len(box) == 4
+            )
+            if values:
+                extent = values[0]
+                for value in values[1:]:
+                    extent |= value
+                boxed_options.append((option, extent))
         for asset in question["media"]:
             if asset.get("type") != "diagram" or not asset.get("bbox"):
                 continue
@@ -2262,29 +3067,34 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
         for option in question["options"]:
             option_text = option.get("text", "")
             suspicious_math = bool(_has_encoding_artifacts(option_text) or _has_displaced_short_option_content(option) or _has_suspicious_math_layout(option_text) or re.search(r"(?:\d\s+\d\s*/\s*\d|\d/\d\s+\d/\d|(?:^|\s)[=+*/]\s{2,}|[A-Za-z)]\d(?:/|\b)|[=+\-−]\s*$)", option_text))
-            if option.get("media") or (option_text.strip() and not suspicious_math):
+            vector_formula = bool(
+                re.search(r"[⃗̂→]", option_text)
+                and re.search(r"[=+−×·/()]", option_text)
+            )
+            if option.get("media") or (option_text.strip() and not suspicious_math and not vector_formula):
                 continue
             crop = _crop_option_source(option, question, page, source_document, media_dir)
             if crop:
                 option["media"].append(crop)
+                recovered_from_region = bool(crop.get("native_text_recovered"))
+                if suspicious_math:
+                    option["review_required"] = True
+                    reason = f"Option {option['id']} has a source crop for verification because its mathematical text may be incomplete."
+                    option["review_reasons"] = list(dict.fromkeys(option.get("review_reasons", []) + [reason]))
+                if recovered_from_region and not suspicious_math:
+                    option["review_required"] = bool(option.get("review_reasons"))
+                if suspicious_math:
+                    question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+            final_option_text = option.get("text", "")
+            if (
+                re.search(r"(?i)\b(?:sin|cos|tan)\s*[−-]\s*¹", final_option_text)
+                and final_option_text.count("(") != final_option_text.count(")")
+            ):
+                reason = "Inverse-trigonometric option has an unmatched parenthesis in native text; inspect the retained source crop for vector-drawn delimiters."
                 option["review_required"] = True
-                reason = f"Option {option['id']} has a source crop for verification because its mathematical text may be incomplete."
                 option["review_reasons"] = list(dict.fromkeys(option.get("review_reasons", []) + [reason]))
-                option.setdefault("math_evidence", []).append({
-                    "original_text": option.get("original_text") or option_text,
-                    "reconstructed_text": None,
-                    "normalized_text": None,
-                    "latex": None,
-                    "mathml": None,
-                    "source_page": crop.get("source_page"),
-                    "source_bbox": crop.get("bbox"),
-                    "component_bboxes": option.get("source", {}).get("content_bboxes", []),
-                    "extraction_method": "high_resolution_source_region_render",
-                    "confidence": None,
-                    "review_required": True,
-                    "review_reasons": [reason],
-                })
-                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [reason]))
+                question["review_required"] = True
+                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [f"Option {option['id']}: {reason}"]))
         if all(option.get("text", "").strip() or option.get("media") for option in question["options"]):
             question["review_reasons"] = [
                 reason for reason in question.get("review_reasons", [])
@@ -2459,6 +3269,7 @@ def run_conversion(
                 "spans": page.get("spans", []),
                 "span_lines": page.get("span_lines", []),
                 "fonts": page.get("fonts", []),
+                "ordered_segments": page.get("ordered_segments", []),
             }
             for page in document_data["pages"]
         ]
@@ -2485,6 +3296,30 @@ def run_conversion(
                 source_document=source_document,
                 media_dir=root / "media",
             )
+            math_extraction = attach_math_evidence(
+                sections,
+                document_data["pages"],
+                source_document,
+                root / "media",
+            )
+            segmentation_issues = validate_segmentation(sections)
+            if segmentation_issues:
+                extraction_issue_summary = Counter(issue["code"] for issue in segmentation_issues)
+                math_extraction["segmentation_issues"] = segmentation_issues
+                warning = "Question/option region validation found: " + ", ".join(
+                    f"{count} {code}" for code, count in sorted(extraction_issue_summary.items())
+                ) + "."
+                math_extraction["warnings"].append(warning)
+                for issue in segmentation_issues:
+                    affected = set(issue.get("question_ids", [])) | ({issue["question_id"]} if issue.get("question_id") else set())
+                    for section in sections:
+                        for question in section.get("questions", []):
+                            if question.get("question_id") in affected:
+                                question["review_required"] = True
+                                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [issue["message"]]))
+        wrapped_sources = attach_raster_svg_wrappers(sections, root / "media")
+        if wrapped_sources:
+            logger.info("Created %d raster SVG wrappers for conversion %s", len(wrapped_sources), conversion_id)
         vision_verification = verify_suspicious_option_crops(sections, root / "media")
         for section in sections:
             for parsed_question in section["questions"]:
@@ -2494,6 +3329,21 @@ def run_conversion(
                 parsed_question.pop("_option_anchor_pages", None)
                 parsed_question.pop("_page_needs_review", None)
                 parsed_question.pop("_source_bbox", None)
+
+        all_parsed_sections = sections
+        sections, classification = classify_mcq_records(all_parsed_sections)
+        (root / "classification_debug.json").write_text(
+            json.dumps({
+                "summary": {key: value for key, value in classification.items() if key != "debug_records"},
+                "unresolved_and_excluded": classification["debug_records"],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if classification["unresolved"] or classification["excluded_non_mcq"]:
+            logger.info(
+                "MCQ classification: conversion=%s confirmed=%d unresolved=%d excluded_non_mcq=%d",
+                conversion_id, classification["confirmed_mcq"], classification["unresolved"], classification["excluded_non_mcq"],
+            )
 
         answer_key_items = [data for _, data, role in extracted if role == "answer_key"]
         answer_parse = parse_answer_key([
@@ -2506,6 +3356,32 @@ def run_conversion(
         for section in sections:
             for parsed_question in section["questions"]:
                 indexed_questions.setdefault(int(parsed_question["question_number"]), []).append(parsed_question)
+
+        for matches in indexed_questions.values():
+            if len(matches) != 1:
+                continue
+            parsed_question = matches[0]
+            source_answer = parsed_question.get("correct_answer")
+            if source_answer is None:
+                continue
+            option_ids = [option["id"] for option in parsed_question["options"]]
+            normalized_source = str(source_answer).strip().upper()
+            if option_ids and all(option_id.isdigit() for option_id in option_ids) and len(normalized_source) == 1 and normalized_source.isalpha():
+                position = ord(normalized_source) - ord("A")
+                if 0 <= position < len(option_ids):
+                    normalized_source = option_ids[position]
+            elif option_ids and all(option_id.isalpha() and len(option_id) == 1 for option_id in option_ids) and normalized_source.isdigit():
+                position = int(normalized_source) - 1
+                if 0 <= position < len(option_ids):
+                    normalized_source = option_ids[position]
+            if normalized_source in option_ids:
+                parsed_question["correct_answer"] = normalized_source
+                parsed_question["answer_provenance"] = "source_marked"
+            else:
+                parsed_question["correct_answer"] = None
+                parsed_question["answer_provenance"] = "answer_key_uncertain"
+                parsed_question["review_required"] = True
+                parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + ["The answer marked in the source does not match a recovered option label."]))
 
         matched = 0
         for number, answer in answer_map.items():
@@ -2522,10 +3398,16 @@ def run_conversion(
                 normalized = str("ABCD".find(answer) + 1) if answer in "ABCD" else answer
             elif option_ids and all(option_id in "ABCD" for option_id in option_ids):
                 normalized = "ABCD"[int(answer) - 1] if answer.isdigit() else answer
-            if normalized in {"1", "2", "3", "4", "A", "B", "C", "D"}:
+            if normalized in option_ids:
                 parsed_question["correct_answer"] = normalized
+                parsed_question["answer_provenance"] = "answer_key_matched"
                 parsed_question.setdefault("confidence", {})["answer_association"] = 1.0
                 matched += 1
+            else:
+                parsed_question["correct_answer"] = None
+                parsed_question["answer_provenance"] = "answer_key_uncertain"
+                parsed_question["review_required"] = True
+                parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + [f"Answer-key value {answer!r} does not identify a recovered option label."]))
 
         missing_answers = sorted(set(indexed_questions) - set(answer_map)) if answer_key_items else []
         for number in missing_answers:
@@ -2533,10 +3415,29 @@ def run_conversion(
                 parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + ["No unambiguous answer-key entry was found for this question."]))
                 parsed_question["review_required"] = True
 
-        total_questions = sum(
-            len(section["questions"])
-            for section in sections
-        )
+        total_questions = classification["confirmed_mcq"]
+
+        # Document-scoped IDs are deterministic for identical source bytes and
+        # layout. Existing display IDs remain unchanged for API compatibility.
+        source_digest = hashlib.sha256()
+        with Path(source_path).open("rb") as source_stream:
+            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                source_digest.update(chunk)
+        source_sha256 = source_digest.hexdigest()
+        document_id = source_sha256[:16]
+        for section in sections:
+            section_name = section.get("section_name", "")
+            for parsed_question in section.get("questions", []):
+                try:
+                    number = int(parsed_question.get("question_number"))
+                except (TypeError, ValueError):
+                    continue
+                stable_question_id = ir_question_id(document_id[:12], number, section_name)
+                parsed_question["stable_id"] = stable_question_id
+                parsed_question["section"] = section_name
+                for option_index, option in enumerate(parsed_question.get("options", []), start=1):
+                    option["stable_id"] = ir_child_id(stable_question_id, "option", option_index)
+                    option["bilingual_text"] = bilingual(option.get("text", ""))
 
         full_text = "\n".join(
             page["text"]
@@ -2552,6 +3453,7 @@ def run_conversion(
             languages.append("hi")
 
         extraction_warnings = list(answer_parse["warnings"])
+        extraction_warnings.extend(math_extraction["warnings"])
         extraction_warnings.extend(vision_verification["warnings"])
         for page in document_data["pages"]:
             extraction_warnings.extend(page.get("ocr_warnings", []))
@@ -2559,6 +3461,10 @@ def run_conversion(
             extraction_warnings.append(f"No unambiguous answer-key entry found for questions: {', '.join(map(str, missing_answers))}.")
         result = {
             "document": {
+                "document_id": document_id,
+                "source_sha256": source_sha256,
+                "schema_version": "2.1",
+                "extraction_date": datetime.now(timezone.utc).isoformat(),
                 "title": title,
                 "total_questions": total_questions,
                 "total_pages": document_data["page_count"],
@@ -2568,9 +3474,31 @@ def run_conversion(
                 ),
                 "language": languages or ["unknown"],
                 "answer_key_matched": matched,
+                "question_classification": {
+                    "parsed_records": classification["parsed_records"],
+                    "confirmed_mcq": classification["confirmed_mcq"],
+                    "unresolved": classification["unresolved"],
+                    "excluded_non_mcq": classification["excluded_non_mcq"],
+                },
                 "answer_key_provided": bool(answer_key_items),
                 "answer_key_extracted": answer_parse["entry_count"],
+                "math_extraction": {
+                    "method": "pymupdf_geometry_ir",
+                    "assigned": math_extraction["assigned"],
+                    "uncertain": math_extraction["uncertain"],
+                    "unassigned": math_extraction["unassigned"],
+                    "unassigned_reasons": math_extraction["unassigned_reasons"],
+                    "unassigned_fragments": math_extraction["unassigned_fragments"],
+                    "segmentation_issues": math_extraction.get("segmentation_issues", []),
+                },
                 "vision_verification": vision_verification,
+                "extraction_summary": {
+                    "confirmed_mcq": classification["confirmed_mcq"],
+                    "unresolved": classification["unresolved"],
+                    "excluded_non_mcq": classification["excluded_non_mcq"],
+                    "media_assets": len(document_data.get("media", [])),
+                    "source_vector_svg": sum(1 for asset in document_data.get("media", []) if asset.get("representation") == "svg_vector"),
+                },
             },
             "sections": sections,
             "extraction_warnings": extraction_warnings + ([
@@ -2581,16 +3509,51 @@ def run_conversion(
             ) else []),
         }
 
+        # Portable ZIP-relative media paths are part of the same validated API
+        # result. Keep the endpoint filename fields for existing browser URLs.
+        for section in result["sections"]:
+            for parsed_question in section["questions"]:
+                for scope in [parsed_question, *parsed_question.get("options", [])]:
+                    for asset in scope.get("media", []):
+                        asset.setdefault("original_filename", asset.get("filename"))
+                        asset["relative_path"] = f"media/{asset['filename']}"
+                        asset["mime_type"] = mimetypes.guess_type(asset["filename"])[0] or "application/octet-stream"
+                        if asset.get("svg_filename"):
+                            asset["svg_relative_path"] = f"media/{asset['svg_filename']}"
+                            asset["svg_mime_type"] = "image/svg+xml"
+                            if asset.get("representation") == "svg_wrapper":
+                                asset["media_format"] = "svg_raster_wrapper"
+                                asset["svg_genuine_vector"] = False
+                                asset.setdefault("svg_fallback_reason", "SVG contains the original raster image only; it is not vector artwork.")
+                        else:
+                            asset.setdefault("svg_fallback_reason", "No separate SVG was generated; the original asset is retained.")
+                        asset.setdefault(
+                            "source_content_type",
+                            "embedded_raster" if asset.get("extraction_method") == "image" else "pdf_region_render",
+                        )
+                        if not asset.get("svg_filename"):
+                            asset.setdefault("media_format", "raster_original")
+                            asset.setdefault("svg_generation_status", "not_attempted")
+                            asset.setdefault("svg_genuine_vector", False)
+                for evidence in [*parsed_question.get("math_evidence", []), *(item for option in parsed_question.get("options", []) for item in option.get("math_evidence", []))]:
+                    if evidence.get("source_crop_filename"):
+                        evidence["source_crop_path"] = f"media/{evidence['source_crop_filename']}"
+
         validated_result = DocumentResult.model_validate(result)
         referenced_media = set()
         for section in validated_result.sections:
             for parsed_question in section.questions:
                 referenced_media.update(asset.filename for asset in parsed_question.media)
+                referenced_media.update(asset.svg_filename for asset in parsed_question.media if asset.svg_filename)
+                referenced_media.update(item.source_crop_filename for item in parsed_question.math_evidence if item.source_crop_filename)
                 for option in parsed_question.options:
                     referenced_media.update(asset.filename for asset in option.media)
+                    referenced_media.update(asset.svg_filename for asset in option.media if asset.svg_filename)
+                    referenced_media.update(item.source_crop_filename for item in option.math_evidence if item.source_crop_filename)
         missing_media = sorted(filename for filename in referenced_media if not (root / "media" / filename).is_file())
         if missing_media:
             raise ValueError(f"Generated media references are missing files: {', '.join(missing_media)}")
+
         result = validated_result.model_dump(mode="json")
 
         referenced_by_file = {}
@@ -2598,40 +3561,116 @@ def run_conversion(
             for parsed_question in section["questions"]:
                 for scope, collection in (("question", parsed_question.get("media", [])), ("option", [asset for option in parsed_question.get("options", []) for asset in option.get("media", [])])):
                     for asset in collection:
-                        row = referenced_by_file.setdefault(asset["filename"], {"question_id": parsed_question["question_id"], "question_number": parsed_question["question_number"], "option_id": None, "association_scope": scope})
+                        association_row = {"question_id": parsed_question["question_id"], "question_number": parsed_question["question_number"], "option_id": None, "association_scope": scope}
+                        row = referenced_by_file.setdefault(asset["filename"], association_row)
+                        if asset.get("svg_filename"):
+                            referenced_by_file.setdefault(asset["svg_filename"], dict(association_row))
                         if scope == "option":
                             for option in parsed_question.get("options", []):
                                 if any(item["filename"] == asset["filename"] for item in option.get("media", [])):
                                     row["option_id"] = option["id"]
+                                    if asset.get("svg_filename"):
+                                        referenced_by_file[asset["svg_filename"]]["option_id"] = option["id"]
                                     break
+                for evidence in parsed_question.get("math_evidence", []):
+                    if evidence.get("source_crop_filename"):
+                        referenced_by_file.setdefault(evidence["source_crop_filename"], {
+                            "question_id": parsed_question["question_id"],
+                            "question_number": parsed_question["question_number"],
+                            "option_id": None,
+                            "association_scope": "math_question_evidence",
+                        })
+                for option in parsed_question.get("options", []):
+                    for evidence in option.get("math_evidence", []):
+                        if evidence.get("source_crop_filename"):
+                            referenced_by_file.setdefault(evidence["source_crop_filename"], {
+                                "question_id": parsed_question["question_id"],
+                                "question_number": parsed_question["question_number"],
+                                "option_id": option["id"],
+                                "association_scope": "math_option_evidence",
+                            })
         asset_by_filename = {asset["filename"]: asset for asset in document_data.get("media", [])}
+        referenced_assets_by_filename = {
+            asset["filename"]: asset
+            for section in result["sections"]
+            for parsed_question in section["questions"]
+            for asset in [*parsed_question.get("media", []), *(item for option in parsed_question.get("options", []) for item in option.get("media", []))]
+        }
+        for section in result["sections"]:
+            for parsed_question in section["questions"]:
+                evidence_scopes = [(parsed_question, None, parsed_question.get("math_evidence", []))]
+                evidence_scopes.extend((parsed_question, option, option.get("math_evidence", [])) for option in parsed_question.get("options", []))
+                for parsed_question, option, evidence_items in evidence_scopes:
+                    for evidence in evidence_items:
+                        filename = evidence.get("source_crop_filename")
+                        if filename:
+                            referenced_assets_by_filename[filename] = {
+                                "asset_id": f"math-evidence-{hashlib.sha1(filename.encode()).hexdigest()[:12]}",
+                                "filename": filename,
+                                "type": "math_evidence_source",
+                                "source_page": evidence.get("source_page"),
+                                "bbox": evidence.get("source_bbox"),
+                            }
+        svg_sources = {
+            asset["svg_filename"]: asset["filename"]
+            for asset in referenced_assets_by_filename.values()
+            if asset.get("svg_filename")
+        }
         manifest_assets = []
         media_dir = root / "media"
         for media_file in sorted(media_dir.iterdir() if media_dir.exists() else []):
             if not media_file.is_file():
                 continue
-            metadata = asset_by_filename.get(media_file.name, {})
+            original_name = svg_sources.get(media_file.name)
+            source_metadata = referenced_assets_by_filename.get(original_name or "", {})
+            is_svg = media_file.suffix.lower() == ".svg"
+            representation = source_metadata.get("representation", "svg_wrapper" if is_svg else "raster")
+            is_wrapper = is_svg and representation == "svg_wrapper"
+            is_vector = is_svg and representation == "svg_vector"
+            metadata = asset_by_filename.get(original_name or media_file.name) or referenced_assets_by_filename.get(original_name or media_file.name, {})
             association = referenced_by_file.get(media_file.name)
             try:
                 with Image.open(media_file) as image:
                     pixel_width, pixel_height = image.size
                     media_type = image.format.lower()
             except Exception:
-                pixel_width = pixel_height = None
-                media_type = "unknown"
+                pixel_width = metadata.get("pixel_width") if is_wrapper else None
+                pixel_height = metadata.get("pixel_height") if is_wrapper else None
+                media_type = "svg" if is_wrapper else "unknown"
+            coordinate_dimensions = None
+            if is_svg:
+                try:
+                    svg_root = ET.parse(media_file).getroot()
+                    view_box = [float(value) for value in re.findall(r"[-+]?\d*\.?\d+", svg_root.attrib.get("viewBox", ""))]
+                    if len(view_box) == 4:
+                        coordinate_dimensions = {"width": view_box[2], "height": view_box[3], "unit": "source_pdf_points" if is_vector else "raster_pixels"}
+                except (OSError, ET.ParseError, ValueError):
+                    coordinate_dimensions = None
             manifest_assets.append({
-                "asset_id": metadata.get("asset_id", media_file.stem),
+                "asset_id": f"{metadata.get('asset_id', original_name)}-svg-wrapper" if is_wrapper else f"{metadata.get('asset_id', original_name)}-svg-vector" if is_vector else metadata.get("asset_id", media_file.stem),
+                "original_asset_id": metadata.get("asset_id") if (is_wrapper or is_vector) else None,
                 "filename": media_file.name,
+                "relative_path": f"media/{media_file.name}",
+                "mime_type": "image/svg+xml" if is_svg else (mimetypes.guess_type(media_file.name)[0] or "application/octet-stream"),
                 "source_page": metadata.get("source_page"),
                 "source_bbox": metadata.get("bbox"),
                 "pixel_dimensions": {"width": pixel_width, "height": pixel_height},
+                "coordinate_dimensions": coordinate_dimensions,
                 "media_type": media_type,
-                "purpose": metadata.get("type", "option_crop" if "_option_" in media_file.name else "diagnostic_evidence"),
+                "purpose": "svg_wrapper" if is_wrapper else metadata.get("type", "option_crop" if "_option_" in media_file.name else "diagnostic_evidence"),
+                "representation": "svg_vector" if is_vector else "svg_wrapper" if is_wrapper else "raster",
+                "media_format": "svg_vector" if is_vector else "svg_raster_wrapper" if is_wrapper else "raster_original",
+                "svg_genuine_vector": is_vector,
+                "svg_generation_status": "source_reconstructed" if is_vector else "raster_wrapper" if is_wrapper else metadata.get("svg_generation_status", "not_attempted"),
+                "svg_fallback_reason": metadata.get("svg_fallback_reason") or ("SVG is a raster wrapper; no vectorization was performed." if is_wrapper else None if is_vector else "No reliable source vector reconstruction was produced; retained original raster asset."),
+                "source_content_type": metadata.get("source_content_type", "raster_wrapper_source" if is_wrapper else "pdf_vector_drawing" if is_vector else "raster_or_pdf_crop"),
+                "original_raster_filename": original_name if (is_wrapper or is_vector) else (media_file.name if media_file.suffix.lower() in {".png", ".jpg", ".jpeg"} else None),
                 "associated_question_id": association.get("question_id") if association else None,
                 "associated_question_number": association.get("question_number") if association else None,
                 "associated_option_id": association.get("option_id") if association else None,
                 "association_scope": association.get("association_scope") if association else None,
-                "extraction_method": metadata.get("extraction_method", "high-resolution PDF region rendering"),
+                "extraction_method": "pymupdf_pdf_drawing_primitives_to_svg" if is_vector else metadata.get("extraction_method", "high-resolution PDF region rendering"),
+                "svg_metadata": metadata.get("svg_vector_metadata") if is_vector else None,
                 "confidence": metadata.get("confidence"),
                 "review_reasons": metadata.get("review_reasons", []) if association else ["Asset is retained as evidence but is not associated with a question or option."],
             })

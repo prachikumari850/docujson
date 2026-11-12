@@ -6,11 +6,12 @@
     "scripts": {
         "dev": "vite",
         "build": "vite build",
-        "test": "node --test src/utils/fileSelection.test.js",
+        "test": "node --test src/utils/fileSelection.test.js src/utils/mathRenderer.test.js src/utils/mathEvidence.test.js src/utils/mediaSource.test.js src/utils/mediaPresentation.test.js src/utils/inlineMath.test.js",
         "preview": "vite preview"
     },
     "dependencies": {
         "@fontsource/poppins": "^5.1.0",
+        "katex": "^0.19.1",
         "lucide-react": "^0.469.0",
         "react": "^18.3.1",
         "react-dom": "^18.3.1"

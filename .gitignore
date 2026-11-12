@@ -9,3 +9,7 @@ storage/*
 !storage/.gitkeep
 .env.example
 !backend/.env.example
+
+# Temporary test and browser artifacts
+backend/.pytest_tmp/
+

@@ -197,6 +197,50 @@ def test_full_width_separator_preserves_column_reading_order():
     assert bounds["left"][1] < bounds["right"][0]
 
 
+def test_inline_math_fragments_follow_prose_by_shared_baseline_and_x_position():
+    def fragment(y0, x0, text, baseline):
+        rect = fitz.Rect(x0, y0, x0 + 24, y0 + 16)
+        span = {"text": text, "bbox": list(rect), "size": 12, "origin": [x0, baseline], "chars": []}
+        return (rect.y0, rect.x0, text, rect, [span])
+
+    lines = [
+        fragment(20.0, 35.0, "A =", 34.0),
+        fragment(19.5, 5.0, "If", 34.0),
+        fragment(19.8, 65.0, "B +", 34.0),
+        fragment(20.2, 95.0, "C", 34.0),
+        fragment(42.0, 5.0, "next line", 56.0),
+    ]
+    ordered, _ = _ordered_layout_lines(lines, 600)
+    assert [line[2] for line in ordered] == ["If", "A =", "B +", "C", "next line"]
+
+
+def test_inline_vector_variables_are_inserted_into_their_source_sentence():
+    def char(value, x0, x1):
+        return {"c": value, "bbox": [x0, 20, x1, 30], "origin": [x0, 30]}
+
+    phrase = "between and is:-"
+    phrase_chars = [
+        char("b", 0, 5), char("e", 5, 10), char("t", 10, 15), char("w", 15, 20),
+        char("e", 20, 25), char("e", 25, 30), char("n", 30, 35), char(" ", 35, 40),
+        char("a", 45, 50), char("n", 50, 55), char("d", 55, 60), char(" ", 60, 65),
+        char("i", 70, 75), char("s", 75, 80), char(":", 80, 85), char("-", 85, 90),
+    ]
+
+    def span(text, bbox, chars):
+        return {"text": text, "bbox": list(bbox), "size": 12, "origin": [bbox[0], 30], "chars": chars}
+
+    sentence_rect = fitz.Rect(0, 20, 100, 30)
+    sentence = (20, 0, phrase, sentence_rect, [span(phrase, sentence_rect, phrase_chars)])
+    a_rect = fitz.Rect(39, 20, 42, 30)
+    c_rect = fitz.Rect(65, 20, 67, 30)
+    a = (20, 39, "A", a_rect, [span("A", a_rect, [char("A", 39, 42)])])
+    c = (20, 65, "C", c_rect, [span("C", c_rect, [char("C", 65, 67)])])
+
+    ordered, _ = _ordered_layout_lines([sentence, a, c], 600)
+    assert len(ordered) == 1
+    assert ordered[0][2] == "between A and C is:-"
+
+
 def test_vector_arrow_requires_above_base_geometry_not_arrow_text_alone():
     def span(text, bbox, char):
         return {
@@ -343,6 +387,23 @@ def test_formula_fragment_before_next_option_label_belongs_to_next_option():
     assert "x2/2" in options[1]["text"]
 
 
+def test_horizontal_option_content_regions_are_split_at_the_next_label():
+    lines = [
+        (100, 40, "Section A", fitz.Rect(40, 100, 120, 112), []),
+        (130, 40, "1. Select the expressions", fitz.Rect(40, 130, 210, 142), []),
+        (160, 60, "(1) x + 1     (2) y + 2", fitz.Rect(60, 160, 250, 172), []),
+        (190, 60, "(3) x - 1     (4) y - 2", fitz.Rect(60, 190, 250, 202), []),
+    ]
+    sections = parse_questions([{"page": 1, "width": 600, "height": 800, "text": "", "lines": lines}])
+    options = sections[0]["questions"][0]["options"]
+    first_boxes = [fitz.Rect(box) for box in options[0]["source"]["content_bboxes"]]
+    second_boxes = [fitz.Rect(box) for box in options[1]["source"]["content_bboxes"]]
+    assert first_boxes and second_boxes
+    assert max(box.x1 for box in first_boxes) < max(box.x1 for box in second_boxes)
+    assert min(box.x0 for box in second_boxes) > min(box.x0 for box in first_boxes)
+    assert max(box.x1 for box in first_boxes) - min(box.x0 for box in first_boxes) < lines[2][3].width
+
+
 def test_multi_vector_row_above_next_question_anchor_is_owned_by_that_question():
     lines = [
         (100, 40, "Section A", fitz.Rect(40, 100, 120, 112), []),
@@ -387,6 +448,49 @@ def test_tall_vector_formula_overlapping_next_anchor_is_not_absorbed_by_prior_op
     questions = {item["question_number"]: item for item in sections[0]["questions"]}
     assert all("A⃗ × B⃗" not in option["text"] for option in questions[1]["options"])
     assert "A⃗ × B⃗" in questions[2]["original_text"]
+
+
+def test_math_fragment_above_option_row_prefers_nearest_label_over_later_row():
+    lines = [
+        (100, 40, "Section A", fitz.Rect(40, 100, 120, 112), []),
+        (120, 40, "1. Choose the matching expression", fitz.Rect(40, 120, 230, 132), []),
+        # This is a detached middle part of option 2, placed just above its
+        # label. A farther look-ahead would incorrectly route it to option 4.
+        (147, 215, "−eᵗ +", fitz.Rect(215, 147, 240, 160), []),
+        (150, 60, "(1) first", fitz.Rect(60, 150, 120, 162), []),
+        (150, 180, "(2) second", fitz.Rect(180, 150, 250, 162), []),
+        (180, 60, "(3) third", fitz.Rect(60, 180, 120, 192), []),
+        (180, 180, "(4) fourth", fitz.Rect(180, 180, 250, 192), []),
+    ]
+    sections = parse_questions([{"page": 1, "width": 600, "height": 800, "text": "", "lines": lines}])
+    options = {item["id"]: item["text"] for item in sections[0]["questions"][0]["options"]}
+    assert "−eᵗ +" in options["2"]
+    assert all("−eᵗ +" not in options[label] for label in ("1", "3", "4"))
+
+
+def test_math_fragment_baseline_slightly_below_label_stays_with_same_option_row():
+    # Tall glyph boxes can put a formula before its label in bbox reading order,
+    # while its actual baseline is a couple of points below that label. A broad
+    # forward-only look-ahead incorrectly gives it to the next option row.
+    label_span = {"text": "(2)", "origin": [180, 150], "size": 12, "chars": []}
+    formula_span = {"text": "−eᵗ+1/t", "origin": [215, 152.5], "size": 11, "chars": []}
+    lines = [
+        (100, 40, "Section A", fitz.Rect(40, 100, 120, 112), []),
+        (120, 40, "1. Choose the matching expression", fitz.Rect(40, 120, 230, 132), []),
+        (150, 60, "(1) first", fitz.Rect(60, 150, 120, 162), []),
+        (147, 215, "−eᵗ+1/t", fitz.Rect(215, 147, 250, 176), [formula_span]),
+        (150, 180, "(2)", fitz.Rect(180, 150, 195, 165), [label_span]),
+        (180, 60, "(3) third", fitz.Rect(60, 180, 120, 192), []),
+        (180, 180, "(4) fourth", fitz.Rect(180, 180, 250, 192), []),
+        (220, 40, "2. Next question", fitz.Rect(40, 220, 180, 232), []),
+        (250, 60, "(1) next", fitz.Rect(60, 250, 120, 262), []),
+    ]
+    sections = parse_questions([{"page": 1, "width": 600, "height": 800, "text": "", "lines": lines}])
+    questions = {q["question_number"]: q for q in sections[0]["questions"]}
+    first_options = {option["id"]: option["text"] for option in questions[1]["options"]}
+    assert "−eᵗ+1/t" in first_options["2"]
+    assert all("−eᵗ+1/t" not in first_options[label] for label in ("1", "3", "4"))
+    assert all("−eᵗ+1/t" not in option["text"] for option in questions[2]["options"])
 
 
 def test_integral_limit_above_next_question_anchor_is_not_appended_to_previous_option():

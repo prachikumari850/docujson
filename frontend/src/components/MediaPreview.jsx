@@ -1,13 +1,7 @@
 import { useState } from "react";
 import { ImageOff } from "lucide-react";
 import { mediaUrl } from "../services/converterApi";
-
-function resolveSource(item, conversionId) {
-    if (item.type === "svg" && item.content) {
-        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(item.content)}`;
-    }
-    return mediaUrl(conversionId, item.filename);
-}
+import { resolveMediaSource } from "../utils/mediaSource";
 
 function MediaItem({ item, conversionId }) {
     const [broken, setBroken] = useState(false);
@@ -17,13 +11,23 @@ function MediaItem({ item, conversionId }) {
         <figure className="overflow-hidden rounded-xl border border-lavender bg-white">
             <div className="flex min-h-32 items-center justify-center bg-lavender-light/60 p-2">
                 {broken ? (
-                    <span className="flex items-center gap-2 text-sm text-navy/60">
-                        <ImageOff size={18} /> Preview unavailable
-                    </span>
+                    <div className="flex flex-col items-center gap-2 text-center text-sm text-navy/70">
+                        <span className="flex items-center gap-2 text-amber-900">
+                            <ImageOff size={18} /> Image preview failed to load
+                        </span>
+                        <a
+                            href={mediaUrl(conversionId, item.filename)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="font-semibold text-deep-purple underline"
+                        >
+                            Open original {item.filename}
+                        </a>
+                    </div>
                 ) : (
                     <button type="button" onClick={() => setExpanded(true)} className="max-w-full cursor-zoom-in" aria-label={`Open larger view of ${item.filename}`}>
                         <img
-                            src={resolveSource(item, conversionId)}
+                            src={resolveMediaSource(item, conversionId, mediaUrl)}
                             alt={item.filename}
                             loading="lazy"
                             onError={() => setBroken(true)}
@@ -44,7 +48,7 @@ function MediaItem({ item, conversionId }) {
             {expanded && !broken && (
                 <div role="dialog" aria-modal="true" aria-label={`Large preview of ${item.filename}`} onClick={() => setExpanded(false)} className="fixed inset-0 z-50 flex items-center justify-center bg-navy/80 p-4">
                     <button type="button" onClick={() => setExpanded(false)} className="absolute right-5 top-5 rounded-full bg-white px-4 py-2 text-sm font-semibold text-navy">Close</button>
-                    <img src={resolveSource(item, conversionId)} alt={item.filename} onClick={(event) => event.stopPropagation()} className="max-h-[88vh] max-w-[92vw] object-contain" />
+                    <img src={resolveMediaSource(item, conversionId, mediaUrl)} alt={item.filename} onClick={(event) => event.stopPropagation()} className="max-h-[88vh] max-w-[92vw] object-contain" />
                 </div>
             )}
         </figure>
