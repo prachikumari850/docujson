@@ -5,6 +5,11 @@ dist/
 __pycache__/
 .pytest_cache/
 *.pyc
+.coverage
+htmlcov/
+playwright-report/
+test-results/
+*.log
 storage/*
 !storage/.gitkeep
 .env.example
@@ -12,4 +17,5 @@ storage/*
 
 # Temporary test and browser artifacts
 backend/.pytest_tmp/
+frontend/.vite/
 

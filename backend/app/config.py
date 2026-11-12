@@ -10,12 +10,12 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     app_name: str = "DocuJSON"
     storage_dir: str = "../storage"
-    max_upload_mb: int = 50
+    max_upload_mb: int = Field(default=50, gt=0)
 
     ollama_enabled: bool = False
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5vl:3b"
-    ollama_timeout_seconds: float = 90.0
+    ollama_timeout_seconds: float = Field(default=90.0, gt=0)
 
     tesseract_cmd: str | None = None
     tessdata_prefix: str | None = None
@@ -23,9 +23,9 @@ class Settings(BaseSettings):
         default="eng+hin",
         validation_alias=AliasChoices("OCR_LANGUAGES", "TESSERACT_LANG"),
     )
-    ocr_dpi: int = 300
-    media_crop_margin_pt: float = 6.0
-    math_crop_dpi: int = 288
+    ocr_dpi: int = Field(default=300, ge=72, le=600)
+    media_crop_margin_pt: float = Field(default=6.0, ge=0, le=72)
+    math_crop_dpi: int = Field(default=288, ge=72, le=600)
 
     cors_origins: str = "http://localhost:5173"
 
