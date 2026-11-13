@@ -11,6 +11,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+from app import database
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -70,3 +71,26 @@ def physics_qp_pdf() -> Path:
 def physics_qp_doc(physics_qp_pdf):
     with fitz.open(physics_qp_pdf) as document:
         yield document
+
+@pytest.fixture(autouse=True)
+def mock_mongodb_for_api_tests(request, monkeypatch):
+    if request.path.name == "test_database_connection.py":
+        return
+
+    def mock_connect():
+        return None
+
+    def mock_close():
+        return None
+
+    monkeypatch.setattr(
+        database,
+        "connect_to_mongo",
+        mock_connect,
+    )
+
+    monkeypatch.setattr(
+        database,
+        "close_mongo_connection",
+        mock_close,
+    )

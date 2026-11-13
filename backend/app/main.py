@@ -9,6 +9,10 @@ import shutil
 import zipfile
 from pathlib import Path
 
+from contextlib import asynccontextmanager
+
+from app import database
+
 import httpx
 from fastapi import (
     BackgroundTasks,
@@ -43,9 +47,19 @@ logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger("docujson")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    database.connect_to_mongo()
+
+    try:
+        yield
+    finally:
+        database.close_mongo_connection()
+
 app = FastAPI(
     title="DocuJSON API",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

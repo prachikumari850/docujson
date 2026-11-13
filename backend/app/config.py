@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,7 +11,14 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     app_name: str = "DocuJSON"
     storage_dir: str = "../storage"
+    mongodb_uri: str = "mongodb://localhost:27017"
+    mongodb_database: str = "neetday"
     max_upload_mb: int = Field(default=50, gt=0)
+
+    session_expire_hours: int = Field(default=24, gt=0, le=720)
+    cookie_secure: bool = False
+    cookie_same_site: Literal["lax", "strict", "none"] = "lax"
+    password_reset_expire_minutes: int = Field(default=30, gt=0, le=1440)
 
     ollama_enabled: bool = False
     ollama_base_url: str = "http://localhost:11434"
