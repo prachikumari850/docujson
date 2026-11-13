@@ -1,32 +1,47 @@
 
 import { useState } from "react";
-import { Link } from "react-router-dom";
-import { Eye, EyeOff, LockKeyhole, Mail, UserRound } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
+import {
+    Eye,
+    EyeOff,
+    LockKeyhole,
+    Mail,
+    UserRound,
+    Building2,
+} from "lucide-react";
 import AuthLayout from "../components/auth/AuthLayout";
+import { register } from "../services/authApi";
+import { useAuth } from "../context/AuthContext";
 
 export default function Signup() {
+    const navigate = useNavigate();
+    const { refreshUser } = useAuth();
     const [showPassword, setShowPassword] = useState(false);
     const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+
     const [form, setForm] = useState({
         name: "",
         email: "",
+        organization_name: "",
         password: "",
         confirmPassword: "",
     });
+
     const [error, setError] = useState("");
-    const [message, setMessage] = useState("");
+    const [loading, setLoading] = useState(false);
 
     const updateField = (event) => {
         setForm((current) => ({
             ...current,
             [event.target.name]: event.target.value,
         }));
+
         setError("");
-        setMessage("");
     };
 
-    const handleSubmit = (event) => {
+    const handleSubmit = async (event) => {
         event.preventDefault();
+        setError("");
 
         if (form.password.length < 8) {
             setError("Password must contain at least 8 characters.");
@@ -38,7 +53,26 @@ export default function Signup() {
             return;
         }
 
-        setMessage("Account creation service is not connected yet.");
+        setLoading(true);
+
+        try {
+            await register({
+                name: form.name.trim(),
+                email: form.email.trim(),
+                organization_name: form.organization_name.trim(),
+                password: form.password,
+            });
+
+            await refreshUser();
+
+            navigate("/dashboard", { replace: true });
+        } catch (err) {
+            setError(
+                err.message || "Unable to create your account. Please try again."
+            );
+        } finally {
+            setLoading(false);
+        }
     };
 
     return (
@@ -51,8 +85,10 @@ export default function Signup() {
                     <label htmlFor="name" className="mb-2 block text-sm font-semibold text-navy">
                         Full Name
                     </label>
+
                     <div className="relative">
                         <UserRound size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="name"
                             name="name"
@@ -61,6 +97,8 @@ export default function Signup() {
                             onChange={updateField}
                             placeholder="Enter your full name"
                             autoComplete="name"
+                            minLength={2}
+                            maxLength={100}
                             required
                             className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-4 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
                         />
@@ -71,8 +109,10 @@ export default function Signup() {
                     <label htmlFor="email" className="mb-2 block text-sm font-semibold text-navy">
                         Email Address
                     </label>
+
                     <div className="relative">
                         <Mail size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="email"
                             name="email"
@@ -81,6 +121,31 @@ export default function Signup() {
                             onChange={updateField}
                             placeholder="Enter your email"
                             autoComplete="email"
+                            maxLength={254}
+                            required
+                            className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-4 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
+                        />
+                    </div>
+                </div>
+
+                <div>
+                    <label htmlFor="organization_name" className="mb-2 block text-sm font-semibold text-navy">
+                        Organization Name
+                    </label>
+
+                    <div className="relative">
+                        <Building2 size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
+                        <input
+                            id="organization_name"
+                            name="organization_name"
+                            type="text"
+                            value={form.organization_name}
+                            onChange={updateField}
+                            placeholder="Enter your school or organization"
+                            autoComplete="organization"
+                            minLength={2}
+                            maxLength={120}
                             required
                             className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-4 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
                         />
@@ -91,8 +156,10 @@ export default function Signup() {
                     <label htmlFor="password" className="mb-2 block text-sm font-semibold text-navy">
                         Password
                     </label>
+
                     <div className="relative">
                         <LockKeyhole size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="password"
                             name="password"
@@ -103,8 +170,10 @@ export default function Signup() {
                             autoComplete="new-password"
                             required
                             minLength={8}
+                            maxLength={128}
                             className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-12 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
                         />
+
                         <button
                             type="button"
                             onClick={() => setShowPassword((visible) => !visible)}
@@ -120,8 +189,10 @@ export default function Signup() {
                     <label htmlFor="confirmPassword" className="mb-2 block text-sm font-semibold text-navy">
                         Confirm Password
                     </label>
+
                     <div className="relative">
                         <LockKeyhole size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="confirmPassword"
                             name="confirmPassword"
@@ -133,6 +204,7 @@ export default function Signup() {
                             required
                             className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-12 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
                         />
+
                         <button
                             type="button"
                             onClick={() => setShowConfirmPassword((visible) => !visible)}
@@ -150,17 +222,12 @@ export default function Signup() {
                     </p>
                 )}
 
-                {message && (
-                    <p role="status" className="rounded-xl bg-sky-soft/70 px-4 py-3 text-sm text-deep-purple">
-                        {message}
-                    </p>
-                )}
-
                 <button
                     type="submit"
-                    className="w-full rounded-xl bg-linear-to-r from-brand-orange to-brand-pink py-3.5 text-sm font-bold text-white shadow-lg shadow-brand-pink/20 transition hover:-translate-y-0.5 hover:shadow-xl"
+                    disabled={loading}
+                    className="w-full rounded-xl bg-linear-to-r from-brand-orange to-brand-pink py-3.5 text-sm font-bold text-white shadow-lg shadow-brand-pink/20 transition hover:-translate-y-0.5 hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0"
                 >
-                    Create Account
+                    {loading ? "Creating Account..." : "Create Account"}
                 </button>
 
                 <p className="pt-2 text-center text-sm text-navy/65">

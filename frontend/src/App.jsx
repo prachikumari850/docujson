@@ -2,6 +2,7 @@
 import { lazy, Suspense } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import DashboardLayout from "./components/layout/DashboardLayout";
+import ProtectedRoute from "./components/auth/ProtectedRoute";
 
 const Home = lazy(() => import("./pages/Home"));
 const Login = lazy(() => import("./pages/Login"));
@@ -35,20 +36,22 @@ export default function App() {
                 <Route path="/signup" element={<Signup />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />
 
-                <Route path="/dashboard" element={<DashboardLayout />}>
+                <Route
+                    path="/dashboard"
+                    element={
+                        <ProtectedRoute>
+                            <DashboardLayout />
+                        </ProtectedRoute>
+                    }
+                >
                     <Route index element={<Dashboard />} />
                     <Route path="imports" element={<Imports />} />
                     <Route path="documents" element={<Documents />} />
                     <Route path="questions" element={<Questions />} />
-
                     <Route path="review" element={<Review />} />
-
                     <Route path="answer-keys" element={<AnswerKeys />} />
-
                     <Route path="publishing" element={<Publishing />} />
-
                     <Route path="analytics" element={<Analytics />} />
-
                     <Route path="settings" element={<Settings />} />
                 </Route>
 

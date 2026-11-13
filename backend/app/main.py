@@ -12,6 +12,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from app import database
+from app.routers.auth import router as auth_router
 
 import httpx
 from fastapi import (
@@ -61,6 +62,8 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(auth_router)
 
 app.add_middleware(
     CORSMiddleware,

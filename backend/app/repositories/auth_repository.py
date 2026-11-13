@@ -42,6 +42,24 @@ class AuthRepository:
     def find_user_by_id(self, user_id: str) -> dict | None:
         return self.users.find_one({"_id": user_id})
 
+    
+    def find_active_membership(self, user_id: str) -> dict | None:
+        return self.memberships.find_one(
+            {
+                "user_id": user_id,
+                "status": "active",
+            }
+        )
+
+    def find_organization_by_id(
+        self,
+        organization_id: str,
+    ) -> dict | None:
+        return self.organizations.find_one(
+            {"_id": organization_id}
+        )
+
+
     def create_registration(
         self,
         name: str,

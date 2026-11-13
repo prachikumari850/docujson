@@ -1,3 +1,4 @@
+import secrets
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +20,10 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     cookie_same_site: Literal["lax", "strict", "none"] = "lax"
     password_reset_expire_minutes: int = Field(default=30, gt=0, le=1440)
+    csrf_secret: str = Field(
+        default_factory=lambda: secrets.token_urlsafe(32),
+        min_length=32,
+    )
 
     ollama_enabled: bool = False
     ollama_base_url: str = "http://localhost:11434"

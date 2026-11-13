@@ -1,18 +1,40 @@
 
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Eye, EyeOff, LockKeyhole, Mail } from "lucide-react";
 import AuthLayout from "../components/auth/AuthLayout";
+import { login } from "../services/authApi";
+import { useAuth } from "../context/AuthContext";
 
 export default function Login() {
+    const navigate = useNavigate();
+    const { refreshUser } = useAuth();
     const [showPassword, setShowPassword] = useState(false);
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
-    const [message, setMessage] = useState("");
+    const [error, setError] = useState("");
+    const [loading, setLoading] = useState(false);
 
-    const handleSubmit = (event) => {
+    const handleSubmit = async (event) => {
         event.preventDefault();
-        setMessage("Authentication service is not connected yet.");
+
+        setError("");
+        setLoading(true);
+
+        try {
+            await login({
+                email: email.trim(),
+                password,
+            });
+
+            await refreshUser();
+
+            navigate("/dashboard", { replace: true });
+        } catch (err) {
+            setError(err.message || "Unable to sign in. Please try again.");
+        } finally {
+            setLoading(false);
+        }
     };
 
     return (
@@ -25,8 +47,10 @@ export default function Login() {
                     <label htmlFor="email" className="mb-2 block text-sm font-semibold text-navy">
                         Email Address
                     </label>
+
                     <div className="relative">
                         <Mail size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="email"
                             type="email"
@@ -45,6 +69,7 @@ export default function Login() {
                         <label htmlFor="password" className="text-sm font-semibold text-navy">
                             Password
                         </label>
+
                         <Link
                             to="/forgot-password"
                             className="text-xs font-semibold text-brand-pink transition hover:text-brand-orange"
@@ -55,6 +80,7 @@ export default function Login() {
 
                     <div className="relative">
                         <LockKeyhole size={18} className="absolute left-4 top-1/2 -translate-y-1/2 text-deep-purple/50" />
+
                         <input
                             id="password"
                             type={showPassword ? "text" : "password"}
@@ -65,6 +91,7 @@ export default function Login() {
                             required
                             className="w-full rounded-xl border border-lavender bg-[#FCFAFF] py-3.5 pl-11 pr-12 text-sm text-navy outline-none transition placeholder:text-navy/35 focus:border-deep-purple focus:ring-2 focus:ring-lavender"
                         />
+
                         <button
                             type="button"
                             onClick={() => setShowPassword((visible) => !visible)}
@@ -76,17 +103,18 @@ export default function Login() {
                     </div>
                 </div>
 
-                {message && (
-                    <p role="status" className="rounded-xl bg-sky-soft/70 px-4 py-3 text-sm text-deep-purple">
-                        {message}
+                {error && (
+                    <p role="alert" className="rounded-xl bg-pink-light px-4 py-3 text-sm text-brand-pink">
+                        {error}
                     </p>
                 )}
 
                 <button
                     type="submit"
-                    className="w-full rounded-xl bg-linear-to-r from-brand-orange to-brand-pink py-3.5 text-sm font-bold text-white shadow-lg shadow-brand-pink/20 transition hover:-translate-y-0.5 hover:shadow-xl"
+                    disabled={loading}
+                    className="w-full rounded-xl bg-linear-to-r from-brand-orange to-brand-pink py-3.5 text-sm font-bold text-white shadow-lg shadow-brand-pink/20 transition hover:-translate-y-0.5 hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0"
                 >
-                    Sign In
+                    {loading ? "Signing In..." : "Sign In"}
                 </button>
 
                 <p className="pt-2 text-center text-sm text-navy/65">
