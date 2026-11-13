@@ -1,3 +1,4 @@
+
 import { createUploadFormData } from "../utils/uploadFormData";
 
 export const API_BASE_URL = (
@@ -33,6 +34,7 @@ function extractDetail(body) {
 
     return "";
 }
+
 async function readError(response) {
     try {
         const body = await response.json();
@@ -63,9 +65,7 @@ async function requestJson(path, options = {}) {
     }
 
     if (!response.ok) {
-        throw new Error(
-            await readError(response)
-        );
+        throw new Error(await readError(response));
     }
 
     return response.json();
@@ -79,19 +79,13 @@ export function uploadDocument(
         const xhr = new XMLHttpRequest();
         const form = createUploadFormData(files, roles);
 
-        xhr.open(
-            "POST",
-            `${API_BASE_URL}/api/convert`
-        );
-
+        xhr.open("POST", `${API_BASE_URL}/api/convert`);
         xhr.responseType = "json";
 
         xhr.upload.onprogress = (event) => {
             if (event.lengthComputable) {
                 onProgress?.(
-                    Math.round(
-                        (event.loaded / event.total) * 100
-                    )
+                    Math.round((event.loaded / event.total) * 100)
                 );
             }
         };
@@ -119,9 +113,7 @@ export function uploadDocument(
         };
 
         xhr.ontimeout = () => {
-            reject(
-                new Error("The upload timed out.")
-            );
+            reject(new Error("The upload timed out."));
         };
 
         if (signal) {
@@ -140,7 +132,6 @@ export function uploadDocument(
                 "abort",
                 () => {
                     xhr.abort();
-
                     reject(
                         new DOMException(
                             "Upload cancelled",
@@ -160,23 +151,55 @@ export function checkHealth(signal) {
     return requestJson("/api/health", { signal });
 }
 
-export function getConversion(
-    conversionId,
-    signal
+export function getAnalyticsOverview(signal) {
+    return requestJson(
+        "/api/analytics/overview",
+        { signal }
+    );
+}
+
+export function getSettings(signal) {
+    return requestJson("/api/settings", { signal });
+}
+
+export function getDocuments(
+    { limit = 100, offset = 0, signal } = {}
 ) {
+    const params = new URLSearchParams({
+        limit: String(limit),
+        offset: String(offset),
+    });
+
+    return requestJson(
+        `/api/documents?${params.toString()}`,
+        { signal }
+    );
+}
+
+export function getConversion(conversionId, signal) {
     return requestJson(
         `/api/conversions/${encodeURIComponent(conversionId)}`,
         { signal }
     );
 }
 
-export async function deleteConversion(
-    conversionId
-) {
-    await fetch(
-        `${API_BASE_URL}/api/conversions/${encodeURIComponent(conversionId)}`,
-        { method: "DELETE" }
-    );
+export async function deleteConversion(conversionId) {
+    let response;
+
+    try {
+        response = await fetch(
+            `${API_BASE_URL}/api/conversions/${encodeURIComponent(conversionId)}`,
+            { method: "DELETE" }
+        );
+    } catch {
+        throw new Error(NETWORK_ERROR);
+    }
+
+    if (!response.ok) {
+        throw new Error(await readError(response));
+    }
+
+    return response.json();
 }
 
 export const jsonUrl = (conversionId) =>
@@ -185,10 +208,7 @@ export const jsonUrl = (conversionId) =>
 export const zipUrl = (conversionId) =>
     `${API_BASE_URL}/api/conversions/${encodeURIComponent(conversionId)}/zip`;
 
-export const mediaUrl = (
-    conversionId,
-    filename
-) =>
+export const mediaUrl = (conversionId, filename) =>
     `${API_BASE_URL}/api/conversions/${encodeURIComponent(conversionId)}/media/${encodeURIComponent(filename)}`;
 
 function filenameFromHeader(header) {
@@ -196,15 +216,10 @@ function filenameFromHeader(header) {
         /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i
     );
 
-    return match
-        ? decodeURIComponent(match[1])
-        : null;
+    return match ? decodeURIComponent(match[1]) : null;
 }
 
-export async function downloadFile(
-    url,
-    fallbackName
-) {
+export async function downloadFile(url, fallbackName) {
     let response;
 
     try {
@@ -214,13 +229,10 @@ export async function downloadFile(
     }
 
     if (!response.ok) {
-        throw new Error(
-            await readError(response)
-        );
+        throw new Error(await readError(response));
     }
 
     const blob = await response.blob();
-
     const filename =
         filenameFromHeader(
             response.headers.get("Content-Disposition")
@@ -239,4 +251,161 @@ export async function downloadFile(
     setTimeout(() => {
         URL.revokeObjectURL(objectUrl);
     }, 1000);
+}
+
+
+export function getQuestions(
+    {
+        search = "",
+        questionType = "",
+        reviewRequired = "",
+        limit = 25,
+        offset = 0,
+        signal,
+    } = {}
+) {
+    const params = new URLSearchParams({
+        limit: String(limit),
+        offset: String(offset),
+    });
+
+    if (search.trim()) {
+        params.set("search", search.trim());
+    }
+
+    if (questionType) {
+        params.set("question_type", questionType);
+    }
+
+    if (reviewRequired !== "") {
+        params.set("review_required", reviewRequired);
+    }
+
+    return requestJson(
+        `/api/questions?${params.toString()}`,
+        { signal }
+    );
+}
+
+export function getReviewQuestions(
+    {
+        search = "",
+        decision = "pending",
+        limit = 25,
+        offset = 0,
+        signal,
+    } = {}
+) {
+    const params = new URLSearchParams({
+        decision,
+        limit: String(limit),
+        offset: String(offset),
+    });
+
+    if (search.trim()) {
+        params.set("search", search.trim());
+    }
+
+    return requestJson(
+        `/api/review/questions?${params.toString()}`,
+        { signal }
+    );
+}
+
+export function updateReviewDecision(
+    conversionId,
+    questionId,
+    { decision, note = "" }
+) {
+    return requestJson(
+        `/api/review/questions/${encodeURIComponent(conversionId)}/${encodeURIComponent(questionId)}`,
+        {
+            method: "PATCH",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                decision,
+                note: note.trim() || null,
+            }),
+        }
+    );
+}
+
+
+export function getAnswerKeys(
+    {
+        search = "",
+        status = "all",
+        decision = "all",
+        limit = 25,
+        offset = 0,
+        signal,
+    } = {}
+) {
+    const params = new URLSearchParams({
+        status,
+        decision,
+        limit: String(limit),
+        offset: String(offset),
+    });
+
+    if (search.trim()) {
+        params.set("search", search.trim());
+    }
+
+    return requestJson(
+        `/api/answer-keys?${params.toString()}`,
+        { signal }
+    );
+}
+
+export function updateAnswerKeyDecision(
+    conversionId,
+    entryId,
+    {
+        decision,
+        correctedAnswer = "",
+        note = "",
+    }
+) {
+    return requestJson(
+        `/api/answer-keys/${encodeURIComponent(conversionId)}/entries/${encodeURIComponent(entryId)}`,
+        {
+            method: "PATCH",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                decision,
+                corrected_answer: correctedAnswer.trim() || null,
+                note: note.trim() || null,
+            }),
+        }
+    );
+}
+
+
+
+export function createPublication(conversionId) {
+    return requestJson(
+        `/api/conversions/${encodeURIComponent(conversionId)}/publish`,
+        {
+            method: "POST",
+        }
+    );
+}
+
+export function getPublications(conversionId, signal) {
+    return requestJson(
+        `/api/conversions/${encodeURIComponent(conversionId)}/publications`,
+        { signal }
+    );
+}
+
+export function getPublication(conversionId, version, signal) {
+    return requestJson(
+        `/api/conversions/${encodeURIComponent(conversionId)}/publications/${encodeURIComponent(version)}`,
+        { signal }
+    );
 }

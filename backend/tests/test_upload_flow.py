@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-
+from app.storage import read_job, update_job
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -60,6 +60,45 @@ def upload(client, filename="questions.txt", content=b"Sample question paper\n1.
     data = {"roles": json.dumps(roles or {filename: "question_paper"})}
     response = client.post("/api/convert", files={"files": (filename, content)}, data=data)
     return response
+
+def upload_with_answer_key(
+    client,
+    paper_filename="paper.txt",
+    key_filename="official_key.txt",
+):
+    paper = (
+        b"SECTION A\n"
+        b"1. First question\n"
+        b"(1) one\n"
+        b"(2) two\n"
+        b"(3) three\n"
+        b"(4) four\n"
+        b"2. Second question\n"
+        b"(1) alpha\n"
+        b"(2) beta\n"
+        b"(3) gamma\n"
+        b"(4) delta"
+    )
+
+    key = b"Q. 1\nA. 3\nQ. 2\nA. 2"
+
+    roles = {
+        paper_filename: "question_paper",
+        key_filename: "answer_key",
+    }
+
+    response = client.post(
+        "/api/convert",
+        files=[
+            ("files", (paper_filename, paper)),
+            ("files", (key_filename, key)),
+        ],
+        data={"roles": json.dumps(roles)},
+    )
+
+    assert response.status_code == 200
+
+    return response.json()["conversion_id"]
 
 
 def test_health(client):
@@ -235,3 +274,901 @@ def test_media_endpoint_and_unknown_conversion(client):
     assert client.get("/api/conversions/missing/json").status_code == 404
     assert client.get("/api/conversions/missing/zip").status_code == 404
     assert client.get("/api/conversions/missing/media/no.png").status_code == 404
+
+
+
+def test_documents_list_returns_completed_conversion_summary(client):
+    response = upload(client, "biology.txt")
+
+    assert response.status_code == 200
+
+    conversion_id = response.json()["conversion_id"]
+
+    listing = client.get("/api/documents")
+
+    assert listing.status_code == 200
+
+    data = listing.json()
+
+    assert data["total"] == 1
+    assert len(data["items"]) == 1
+
+    document = data["items"][0]
+
+    assert document["conversion_id"] == conversion_id
+    assert document["status"] == "completed"
+    assert document["filename"] == "biology.txt"
+    assert document["format"] == "txt"
+    assert document["total_questions"] >= 0
+
+    assert "result" not in document
+    assert "storage_path" not in document
+
+
+def test_documents_list_supports_pagination(client):
+    first = upload(client, "first.txt")
+    second = upload(client, "second.txt")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    first_page = client.get("/api/documents?limit=1&offset=0")
+    second_page = client.get("/api/documents?limit=1&offset=1")
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+
+    first_data = first_page.json()
+    second_data = second_page.json()
+
+    assert first_data["total"] == 2
+    assert second_data["total"] == 2
+    assert len(first_data["items"]) == 1
+    assert len(second_data["items"]) == 1
+
+    assert (
+        first_data["items"][0]["conversion_id"]
+        != second_data["items"][0]["conversion_id"]
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?limit=0",
+        "?limit=101",
+        "?offset=-1",
+    ],
+)
+def test_documents_list_rejects_invalid_pagination(client, query):
+    response = client.get(f"/api/documents{query}")
+
+    assert response.status_code == 422
+
+
+
+def test_questions_list_returns_extracted_questions(client):
+    response = upload(
+        client,
+        "biology.txt",
+        b"1. What is photosynthesis?\nA. Respiration\nB. Food production in plants\nC. Digestion\nD. Transpiration",
+    )
+
+    assert response.status_code == 200
+
+    listing = client.get("/api/questions")
+
+    assert listing.status_code == 200
+
+    data = listing.json()
+
+    assert data["total"] >= 1
+    assert len(data["items"]) >= 1
+
+    question = data["items"][0]
+
+    assert question["conversion_id"] == response.json()["conversion_id"]
+    assert question["source_filename"] == "biology.txt"
+    assert "question" in question
+    assert "options" in question
+
+
+def test_questions_list_supports_search(client):
+    response = upload(
+        client,
+        "biology.txt",
+        b"1. What is photosynthesis?\nA. Respiration\nB. Food production in plants\nC. Digestion\nD. Transpiration",
+    )
+
+    assert response.status_code == 200
+
+    listing = client.get("/api/questions", params={"search": "photosynthesis"})
+
+    assert listing.status_code == 200
+    assert listing.json()["total"] >= 1
+
+
+def test_questions_list_supports_pagination(client):
+    first = upload(client, "first.txt")
+    second = upload(client, "second.txt")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    listing = client.get("/api/questions", params={"limit": 1, "offset": 0})
+
+    assert listing.status_code == 200
+    assert listing.json()["limit"] == 1
+    assert len(listing.json()["items"]) == 1
+    assert listing.json()["total"] >= 1
+
+
+def test_questions_list_rejects_invalid_pagination(client):
+    response = client.get("/api/questions", params={"limit": 101})
+
+    assert response.status_code == 422
+
+
+def test_review_queue_returns_flagged_questions(client):
+    response = upload(
+        client,
+        "review.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+
+    assert response.status_code == 200
+
+    conversion_id = response.json()["conversion_id"]
+    job = read_job(conversion_id)
+
+    question = next(
+        question
+        for section in job["result"]["sections"]
+        for question in section["questions"]
+    )
+
+    question["review_required"] = True
+    update_job(conversion_id, result=job["result"])
+
+    listing = client.get("/api/review/questions")
+
+    assert listing.status_code == 200
+
+    data = listing.json()
+
+    assert data["total"] == 1
+    assert data["items"][0]["question_id"] == question["question_id"]
+    assert data["items"][0]["review_decision"] == "pending"
+
+
+def test_review_question_can_be_approved(client):
+    response = upload(
+        client,
+        "review.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+
+    conversion_id = response.json()["conversion_id"]
+    job = read_job(conversion_id)
+
+    question = next(
+        question
+        for section in job["result"]["sections"]
+        for question in section["questions"]
+    )
+
+    question["review_required"] = True
+    update_job(conversion_id, result=job["result"])
+
+    decision = client.patch(
+        f"/api/review/questions/{conversion_id}/{question['question_id']}",
+        json={
+            "decision": "approved",
+            "note": "Verified against the source.",
+        },
+    )
+
+    assert decision.status_code == 200
+    assert decision.json()["decision"] == "approved"
+    assert decision.json()["note"] == "Verified against the source."
+    assert decision.json()["reviewed_at"]
+
+    listing = client.get(
+        "/api/review/questions",
+        params={"decision": "approved"},
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 1
+
+    pending = client.get("/api/review/questions")
+
+    assert pending.json()["total"] == 0
+
+    stored_job = read_job(conversion_id)
+
+    assert stored_job["review_decisions"][question["question_id"]]["decision"] == "approved"
+    assert stored_job["result"] == job["result"]
+
+
+def test_review_question_can_be_rejected(client):
+    response = upload(
+        client,
+        "review.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+
+    conversion_id = response.json()["conversion_id"]
+    job = read_job(conversion_id)
+
+    question = next(
+        question
+        for section in job["result"]["sections"]
+        for question in section["questions"]
+    )
+
+    question["review_required"] = True
+    update_job(conversion_id, result=job["result"])
+
+    decision = client.patch(
+        f"/api/review/questions/{conversion_id}/{question['question_id']}",
+        json={"decision": "rejected"},
+    )
+
+    assert decision.status_code == 200
+    assert decision.json()["decision"] == "rejected"
+
+    listing = client.get(
+        "/api/review/questions",
+        params={"decision": "rejected"},
+    )
+
+    assert listing.json()["total"] == 1
+
+
+def test_review_question_rejects_missing_conversion(client):
+    response = client.patch(
+        "/api/review/questions/missing/question-1",
+        json={"decision": "approved"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_review_question_rejects_missing_question(client):
+    response = upload(client, "review.txt")
+
+    conversion_id = response.json()["conversion_id"]
+
+    decision = client.patch(
+        f"/api/review/questions/{conversion_id}/missing-question",
+        json={"decision": "approved"},
+    )
+
+    assert decision.status_code == 404
+
+
+def test_review_question_rejects_invalid_decision(client):
+    response = upload(client, "review.txt")
+
+    conversion_id = response.json()["conversion_id"]
+
+    decision = client.patch(
+        f"/api/review/questions/{conversion_id}/question-1",
+        json={"decision": "pending"},
+    )
+
+    assert decision.status_code == 422
+
+
+def test_review_queue_supports_search(client):
+    response = upload(
+        client,
+        "review.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+
+    conversion_id = response.json()["conversion_id"]
+    job = read_job(conversion_id)
+
+    question = next(
+        question
+        for section in job["result"]["sections"]
+        for question in section["questions"]
+    )
+
+    question["review_required"] = True
+    update_job(conversion_id, result=job["result"])
+
+    listing = client.get(
+        "/api/review/questions",
+        params={"search": "photosynthesis"},
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 1
+
+
+def test_review_queue_rejects_invalid_pagination(client):
+    response = client.get(
+        "/api/review/questions",
+        params={"limit": 101},
+    )
+
+    assert response.status_code == 422
+
+
+def test_answer_key_metadata_is_persisted_separately_from_result(client):
+    paper = (
+        b"SECTION A\n"
+        b"1. First question\n"
+        b"(1) one\n"
+        b"(2) two\n"
+        b"(3) three\n"
+        b"(4) four"
+    )
+    key = b"Q. 1\nA. 3"
+
+    files = [
+        ("files", ("paper.txt", paper)),
+        ("files", ("official_key.txt", key)),
+    ]
+    roles = {
+        "paper.txt": "question_paper",
+        "official_key.txt": "answer_key",
+    }
+
+    response = client.post(
+        "/api/convert",
+        files=files,
+        data={"roles": json.dumps(roles)},
+    )
+
+    assert response.status_code == 200
+
+    conversion_id = response.json()["conversion_id"]
+
+    job = client.get(
+        f"/api/conversions/{conversion_id}"
+    ).json()
+
+    answer_key = job["answer_key"]
+
+    assert answer_key["provided"] is True
+    assert answer_key["filename"] == "official_key.txt"
+    assert answer_key["total_entries"] == 1
+    assert answer_key["matched"] == 1
+    assert answer_key["entries"][0]["question_number"] == 1
+    assert answer_key["entries"][0]["answer"] == "3"
+    assert answer_key["entries"][0]["status"] == "matched"
+    assert answer_key["entries"][0]["matched_question_id"]
+
+    assert job["answer_key_decisions"] == {}
+
+    result_file = (
+        settings.storage_path
+        / conversion_id
+        / "result.json"
+    )
+
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+
+    assert "answer_key" not in result
+    assert result["document"]["answer_key_matched"] == 1
+
+
+def test_answer_keys_list_entries(client):
+    conversion_id = upload_with_answer_key(client)
+
+    response = client.get("/api/answer-keys")
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["total"] == 2
+    assert len(data["items"]) == 2
+
+    entry = data["items"][0]
+
+    assert entry["conversion_id"] == conversion_id
+    assert entry["source_filename"] == "official_key.txt"
+    assert entry["review_decision"] == "pending"
+
+
+def test_answer_keys_support_search(client):
+    upload_with_answer_key(client)
+
+    response = client.get(
+        "/api/answer-keys",
+        params={"search": "official_key.txt"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+
+    response = client.get(
+        "/api/answer-keys",
+        params={"search": "999"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+
+
+def test_answer_keys_support_status_filter(client):
+    upload_with_answer_key(client)
+
+    response = client.get(
+        "/api/answer-keys",
+        params={"status": "matched"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+
+    response = client.get(
+        "/api/answer-keys",
+        params={"status": "unmatched"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+
+
+def test_answer_keys_support_pagination(client):
+    upload_with_answer_key(client)
+
+    response = client.get(
+        "/api/answer-keys",
+        params={"limit": 1, "offset": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+    assert len(response.json()["items"]) == 1
+
+    second_page = client.get(
+        "/api/answer-keys",
+        params={"limit": 1, "offset": 1},
+    )
+
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+
+    assert (
+        response.json()["items"][0]["entry_id"]
+        != second_page.json()["items"][0]["entry_id"]
+    )
+
+
+def test_answer_key_entry_can_be_approved_with_correction(client):
+    conversion_id = upload_with_answer_key(client)
+
+    listing = client.get("/api/answer-keys").json()
+    entry = listing["items"][0]
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/{entry['entry_id']}",
+        json={
+            "decision": "approved",
+            "corrected_answer": "4",
+            "note": "Verified against the official source.",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["decision"] == "approved"
+    assert data["corrected_answer"] == "4"
+    assert data["note"] == "Verified against the official source."
+    assert data["reviewed_at"]
+
+
+def test_answer_key_entry_can_be_rejected(client):
+    conversion_id = upload_with_answer_key(client)
+
+    entry = client.get("/api/answer-keys").json()["items"][0]
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/{entry['entry_id']}",
+        json={
+            "decision": "rejected",
+            "note": "Source answer needs verification.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["decision"] == "rejected"
+
+    rejected = client.get(
+        "/api/answer-keys",
+        params={"decision": "rejected"},
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["total"] == 1
+
+
+def test_answer_keys_support_decision_filter(client):
+    conversion_id = upload_with_answer_key(client)
+
+    entries = client.get("/api/answer-keys").json()["items"]
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/{entries[0]['entry_id']}",
+        json={"decision": "approved"},
+    )
+
+    assert response.status_code == 200
+
+    approved = client.get(
+        "/api/answer-keys",
+        params={"decision": "approved"},
+    )
+
+    pending = client.get(
+        "/api/answer-keys",
+        params={"decision": "pending"},
+    )
+
+    assert approved.json()["total"] == 1
+    assert pending.json()["total"] == 1
+
+
+def test_answer_key_decision_does_not_modify_extraction_result(client):
+    conversion_id = upload_with_answer_key(client)
+
+    original_job = read_job(conversion_id)
+    original_result = original_job["result"].copy()
+
+    entry = original_job["answer_key"]["entries"][0]
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/{entry['entry_id']}",
+        json={
+            "decision": "approved",
+            "corrected_answer": "4",
+            "note": "Manual correction.",
+        },
+    )
+
+    assert response.status_code == 200
+
+    updated_job = read_job(conversion_id)
+
+    assert updated_job["result"] == original_result
+    assert updated_job["answer_key"]["entries"][0]["answer"] == entry["answer"]
+
+    result_file = (
+        settings.storage_path
+        / conversion_id
+        / "result.json"
+    )
+
+    exported_result = json.loads(
+        result_file.read_text(encoding="utf-8")
+    )
+
+    assert exported_result == original_result
+
+
+def test_answer_key_decision_rejects_missing_conversion(client):
+    response = client.patch(
+        "/api/answer-keys/missing/entries/missing-entry",
+        json={"decision": "approved"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_answer_key_decision_rejects_missing_entry(client):
+    conversion_id = upload_with_answer_key(client)
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/missing-entry",
+        json={"decision": "approved"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_answer_key_decision_rejects_invalid_decision(client):
+    conversion_id = upload_with_answer_key(client)
+
+    entry = client.get("/api/answer-keys").json()["items"][0]
+
+    response = client.patch(
+        f"/api/answer-keys/{conversion_id}/entries/{entry['entry_id']}",
+        json={"decision": "pending"},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_status"),
+    [
+        ({"limit": 0}, 422),
+        ({"limit": 101}, 422),
+        ({"offset": -1}, 422),
+        ({"search": "x" * 201}, 422),
+    ],
+)
+def test_answer_keys_reject_invalid_query_parameters(
+    client,
+    params,
+    expected_status,
+):
+    response = client.get(
+        "/api/answer-keys",
+        params=params,
+    )
+
+    assert response.status_code == expected_status 
+
+
+def test_publish_creates_first_version(client):
+    conversion_id = upload_with_answer_key(client)
+
+    job = read_job(conversion_id)
+
+    for section in job["result"]["sections"]:
+        for question in section["questions"]:
+            question["review_required"] = False
+
+    update_job(conversion_id, result=job["result"])
+
+    entries = job["answer_key"]["entries"]
+
+    for entry in entries:
+        update_job(
+            conversion_id,
+            answer_key_decisions={
+                **read_job(conversion_id).get("answer_key_decisions", {}),
+                entry["entry_id"]: {
+                    "decision": "approved",
+                    "corrected_answer": None,
+                    "note": None,
+                    "reviewed_at": "2026-11-14T00:00:00+00:00",
+                },
+            },
+        )
+
+    response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    assert response.status_code == 200
+
+    publication = response.json()
+
+    assert publication["version"] == 1
+    assert publication["total_questions"] == 2
+    assert publication["publication_id"] == f"{conversion_id}-v1"
+
+
+def test_publish_creates_immutable_versions(client):
+    conversion_id = upload_with_answer_key(client)
+
+    job = read_job(conversion_id)
+
+    for section in job["result"]["sections"]:
+        for question in section["questions"]:
+            question["review_required"] = False
+
+    update_job(conversion_id, result=job["result"])
+
+    for entry in job["answer_key"]["entries"]:
+        current = read_job(conversion_id)
+        decisions = current.get("answer_key_decisions", {})
+        decisions[entry["entry_id"]] = {
+            "decision": "approved",
+            "corrected_answer": None,
+            "note": None,
+            "reviewed_at": "2026-11-14T00:00:00+00:00",
+        }
+        update_job(conversion_id, answer_key_decisions=decisions)
+
+    first = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+    assert second.status_code == 200
+
+    assert first.json()["version"] == 1
+    assert second.json()["version"] == 2
+
+    history = client.get(
+        f"/api/conversions/{conversion_id}/publications"
+    )
+
+    assert history.status_code == 200
+    assert history.json()["total"] == 2
+
+
+def test_publish_rejects_unreviewed_questions(client):
+    conversion_id = upload_with_answer_key(client)
+
+    response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    assert response.status_code == 409
+
+
+def test_publish_does_not_modify_original_result(client):
+    conversion_id = upload_with_answer_key(client)
+
+    original = read_job(conversion_id)["result"]
+
+    client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    updated = read_job(conversion_id)["result"]
+
+    assert updated == original
+
+    result_file = (
+        settings.storage_path
+        / conversion_id
+        / "result.json"
+    )
+
+    exported = json.loads(
+        result_file.read_text(encoding="utf-8")
+    )
+
+    assert exported == original
+
+
+def test_get_missing_publication_returns_404(client):
+    conversion_id = upload_with_answer_key(client)
+
+    response = client.get(
+        f"/api/conversions/{conversion_id}/publications/1"
+    )
+
+    assert response.status_code == 404
+
+def prepare_publishable_conversion(client):
+    conversion_id = upload_with_answer_key(client)
+    job = read_job(conversion_id)
+
+    for section in job["result"]["sections"]:
+        for question in section["questions"]:
+            question["review_required"] = False
+
+    decisions = {}
+
+    for entry in job["answer_key"]["entries"]:
+        decisions[entry["entry_id"]] = {
+            "decision": "approved",
+            "corrected_answer": None,
+            "note": None,
+            "reviewed_at": "2026-11-14T00:00:00+00:00",
+        }
+
+    update_job(
+        conversion_id,
+        result=job["result"],
+        answer_key_decisions=decisions,
+    )
+
+    return conversion_id
+
+def test_rejected_question_is_excluded_from_publication(client):
+    conversion_id = prepare_publishable_conversion(client)
+    job = read_job(conversion_id)
+
+    first_entry = job["answer_key"]["entries"][0]
+    rejected_question_id = first_entry["matched_question_id"]
+
+    update_job(
+        conversion_id,
+        review_decisions={
+            rejected_question_id: {
+                "decision": "rejected",
+                "note": "Incorrect extraction.",
+                "reviewed_at": "2026-11-14T00:00:00+00:00",
+            }
+        },
+    )
+
+    response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    assert response.status_code == 200
+
+    publication = response.json()
+    published_ids = {
+        question["question_id"]
+        for question in publication["questions"]
+    }
+
+    assert rejected_question_id not in published_ids
+    assert publication["total_questions"] == 1
+
+def test_approved_answer_key_correction_is_published(client):
+    conversion_id = prepare_publishable_conversion(client)
+    job = read_job(conversion_id)
+
+    entry = job["answer_key"]["entries"][0]
+
+    decisions = job["answer_key_decisions"]
+    decisions[entry["entry_id"]]["corrected_answer"] = "4"
+
+    update_job(
+        conversion_id,
+        answer_key_decisions=decisions,
+    )
+
+    response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    assert response.status_code == 200
+
+    publication = response.json()
+
+    question = next(
+        question
+        for question in publication["questions"]
+        if question["question_id"] == entry["matched_question_id"]
+    )
+
+    assert question["correct_answer"] == "4"
+
+def test_invalid_answer_key_correction_excludes_question(client):
+    conversion_id = prepare_publishable_conversion(client)
+    job = read_job(conversion_id)
+
+    entry = job["answer_key"]["entries"][0]
+
+    decisions = job["answer_key_decisions"]
+    decisions[entry["entry_id"]]["corrected_answer"] = "999"
+
+    update_job(
+        conversion_id,
+        answer_key_decisions=decisions,
+    )
+
+    response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+
+    assert response.status_code == 200
+
+    publication = response.json()
+
+    published_ids = {
+        question["question_id"]
+        for question in publication["questions"]
+    }
+
+    assert entry["matched_question_id"] not in published_ids
+    assert publication["total_questions"] == 1

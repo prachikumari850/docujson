@@ -3345,35 +3345,85 @@ def run_conversion(
                 conversion_id, classification["confirmed_mcq"], classification["unresolved"], classification["excluded_non_mcq"],
             )
 
-        answer_key_items = [data for _, data, role in extracted if role == "answer_key"]
+        
+        answer_key_items = [
+            (path, data)
+            for path, data, role in extracted
+            if role == "answer_key"
+        ]
+
         answer_parse = parse_answer_key([
             page
-            for data in answer_key_items
+            for _, data in answer_key_items
             for page in data["pages"]
-        ]) if answer_key_items else {"answers": {}, "entry_count": 0, "warnings": []}
+        ]) if answer_key_items else {
+            "answers": {},
+            "entry_count": 0,
+            "entries": [],
+            "warnings": [],
+        }
+
         answer_map = answer_parse["answers"]
+        answer_entries = answer_parse["entries"]
+
+        answer_key_filename = (
+            source_name_map.get(answer_key_items[0][0].name, answer_key_items[0][0].name)
+            if answer_key_items
+            else None
+        )
+
         indexed_questions = {}
+
         for section in sections:
             for parsed_question in section["questions"]:
-                indexed_questions.setdefault(int(parsed_question["question_number"]), []).append(parsed_question)
+                try:
+                    number = int(parsed_question["question_number"])
+                except (TypeError, ValueError):
+                    continue
+
+                indexed_questions.setdefault(number, []).append(parsed_question)
 
         for matches in indexed_questions.values():
             if len(matches) != 1:
                 continue
+
             parsed_question = matches[0]
             source_answer = parsed_question.get("correct_answer")
+
             if source_answer is None:
                 continue
-            option_ids = [option["id"] for option in parsed_question["options"]]
+
+            option_ids = [
+                option["id"]
+                for option in parsed_question["options"]
+            ]
+
             normalized_source = str(source_answer).strip().upper()
-            if option_ids and all(option_id.isdigit() for option_id in option_ids) and len(normalized_source) == 1 and normalized_source.isalpha():
+
+            if (
+                option_ids
+                and all(option_id.isdigit() for option_id in option_ids)
+                and len(normalized_source) == 1
+                and normalized_source.isalpha()
+            ):
                 position = ord(normalized_source) - ord("A")
+
                 if 0 <= position < len(option_ids):
                     normalized_source = option_ids[position]
-            elif option_ids and all(option_id.isalpha() and len(option_id) == 1 for option_id in option_ids) and normalized_source.isdigit():
+
+            elif (
+                option_ids
+                and all(
+                    option_id.isalpha() and len(option_id) == 1
+                    for option_id in option_ids
+                )
+                and normalized_source.isdigit()
+            ):
                 position = int(normalized_source) - 1
+
                 if 0 <= position < len(option_ids):
                     normalized_source = option_ids[position]
+
             if normalized_source in option_ids:
                 parsed_question["correct_answer"] = normalized_source
                 parsed_question["answer_provenance"] = "source_marked"
@@ -3381,39 +3431,133 @@ def run_conversion(
                 parsed_question["correct_answer"] = None
                 parsed_question["answer_provenance"] = "answer_key_uncertain"
                 parsed_question["review_required"] = True
-                parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + ["The answer marked in the source does not match a recovered option label."]))
+                parsed_question["review_reasons"] = list(dict.fromkeys(
+                    parsed_question.get("review_reasons", []) + [
+                        "The answer marked in the source does not match a recovered option label."
+                    ]
+                ))
 
         matched = 0
-        for number, answer in answer_map.items():
-            matches = indexed_questions.get(number, [])
-            if len(matches) != 1:
-                for parsed_question in matches:
-                    parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + [f"Answer for question {number} could not be matched unambiguously."]))
-                    parsed_question["review_required"] = True
+
+        for entry in answer_entries:
+            if entry["status"] in {"duplicate", "conflicting"}:
                 continue
+
+            number = entry["question_number"]
+            answer = entry["answer"]
+            matches = indexed_questions.get(number, [])
+
+            if not matches:
+                entry["status"] = "unmatched"
+                continue
+
+            if len(matches) > 1:
+                entry["status"] = "ambiguous"
+                entry["candidate_question_ids"] = [
+                    question["question_id"]
+                    for question in matches
+                ]
+
+                for parsed_question in matches:
+                    parsed_question["review_reasons"] = list(dict.fromkeys(
+                        parsed_question.get("review_reasons", []) + [
+                            f"Answer for question {number} could not be matched unambiguously."
+                        ]
+                    ))
+                    parsed_question["review_required"] = True
+
+                continue
+
             parsed_question = matches[0]
-            option_ids = [option["id"] for option in parsed_question["options"]]
+            option_ids = [
+                option["id"]
+                for option in parsed_question["options"]
+            ]
+
             normalized = answer
+
             if option_ids and all(option_id.isdigit() for option_id in option_ids):
-                normalized = str("ABCD".find(answer) + 1) if answer in "ABCD" else answer
+                normalized = (
+                    str("ABCD".find(answer) + 1)
+                    if answer in "ABCD"
+                    else answer
+                )
+
             elif option_ids and all(option_id in "ABCD" for option_id in option_ids):
-                normalized = "ABCD"[int(answer) - 1] if answer.isdigit() else answer
+                normalized = (
+                    "ABCD"[int(answer) - 1]
+                    if answer.isdigit() and 1 <= int(answer) <= 4
+                    else answer
+                )
+
             if normalized in option_ids:
                 parsed_question["correct_answer"] = normalized
                 parsed_question["answer_provenance"] = "answer_key_matched"
-                parsed_question.setdefault("confidence", {})["answer_association"] = 1.0
+                parsed_question.setdefault("confidence", {})[
+                    "answer_association"
+                ] = 1.0
+
+                entry["status"] = "matched"
+                entry["matched_question_id"] = parsed_question["question_id"]
+
                 matched += 1
+
             else:
+                entry["status"] = "invalid"
+                entry["matched_question_id"] = parsed_question["question_id"]
+
                 parsed_question["correct_answer"] = None
                 parsed_question["answer_provenance"] = "answer_key_uncertain"
                 parsed_question["review_required"] = True
-                parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + [f"Answer-key value {answer!r} does not identify a recovered option label."]))
+                parsed_question["review_reasons"] = list(dict.fromkeys(
+                    parsed_question.get("review_reasons", []) + [
+                        f"Answer-key value {answer!r} does not identify a recovered option label."
+                    ]
+                ))
 
-        missing_answers = sorted(set(indexed_questions) - set(answer_map)) if answer_key_items else []
+        missing_answers = (
+            sorted(set(indexed_questions) - set(answer_map))
+            if answer_key_items
+            else []
+        )
+
         for number in missing_answers:
             for parsed_question in indexed_questions[number]:
-                parsed_question["review_reasons"] = list(dict.fromkeys(parsed_question.get("review_reasons", []) + ["No unambiguous answer-key entry was found for this question."]))
+                parsed_question["review_reasons"] = list(dict.fromkeys(
+                    parsed_question.get("review_reasons", []) + [
+                        "No unambiguous answer-key entry was found for this question."
+                    ]
+                ))
                 parsed_question["review_required"] = True
+
+        answer_key_status_counts = {
+            status: sum(
+                entry["status"] == status
+                for entry in answer_entries
+            )
+            for status in (
+                "matched",
+                "unmatched",
+                "ambiguous",
+                "duplicate",
+                "conflicting",
+                "invalid",
+            )
+        }
+
+        answer_key_metadata = {
+            "provided": bool(answer_key_items),
+            "filename": answer_key_filename,
+            "total_entries": len(answer_entries),
+            "matched": matched,
+            "unmatched": answer_key_status_counts["unmatched"],
+            "ambiguous": answer_key_status_counts["ambiguous"],
+            "duplicate": answer_key_status_counts["duplicate"],
+            "conflicting": answer_key_status_counts["conflicting"],
+            "invalid": answer_key_status_counts["invalid"],
+            "entries": answer_entries,
+        }
+
 
         total_questions = classification["confirmed_mcq"]
 
@@ -3699,6 +3843,8 @@ def run_conversion(
             stage="Conversion complete",
             error=None,
             result=result,
+            answer_key=answer_key_metadata,
+            answer_key_decisions={},
         )
 
     except Exception as error:

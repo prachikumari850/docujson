@@ -51,3 +51,51 @@ def test_table_rows_can_continue_across_lines_and_pages():
     ]
     parsed = parse_answer_key(pages)
     assert parsed["answers"] == {1: "3", 2: "4", 3: "1", 4: "2"}
+
+
+def test_parser_returns_structured_entries_with_source_pages():
+    parsed = parse_answer_key([
+        {"page": 4, "text": "1. C\n2. B"},
+        {"page": 5, "text": "3. A"},
+    ])
+
+    assert parsed["entry_count"] == 3
+    assert len(parsed["entries"]) == 3
+
+    assert parsed["entries"][0] == {
+        "entry_id": "answer-entry-1",
+        "question_number": 1,
+        "answer": "C",
+        "page": 4,
+        "source_format": "individual",
+        "status": "extracted",
+        "warnings": [],
+    }
+
+    assert parsed["entries"][2]["page"] == 5
+
+
+def test_parser_marks_duplicate_entries_in_structured_output():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "1. C\n1. C"},
+    ])
+
+    assert parsed["answers"] == {}
+    assert parsed["entry_count"] == 2
+    assert all(
+        entry["status"] == "duplicate"
+        for entry in parsed["entries"]
+    )
+
+
+def test_parser_marks_conflicting_entries_in_structured_output():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "1. C\n1. B"},
+    ])
+
+    assert parsed["answers"] == {}
+    assert parsed["entry_count"] == 2
+    assert all(
+        entry["status"] == "conflicting"
+        for entry in parsed["entries"]
+    )

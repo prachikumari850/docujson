@@ -1,3 +1,7 @@
+from datetime import datetime, timezone
+from typing import Literal
+
+from pydantic import BaseModel, Field
 import json
 import logging
 import re
@@ -13,6 +17,7 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -23,6 +28,13 @@ from app.storage import (
     job_dir,
     read_job,
     update_job,
+    list_jobs,
+    save_review_decision,
+    save_answer_key_decision,
+    create_publication,
+    list_publications,
+    read_publication,
+    get_analytics_overview,
 )
 from app.services.engine import run_conversion
 
@@ -50,6 +62,14 @@ ALLOWED_EXTENSIONS = {
     ".txt",
 }
 
+class ReviewDecisionRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    note: str | None = Field(default=None, max_length=2000)
+
+class AnswerKeyDecisionRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    corrected_answer: str | None = Field(default=None, max_length=50)
+    note: str | None = Field(default=None, max_length=2000)
 
 @app.get("/api/health")
 async def health():
@@ -88,6 +108,456 @@ async def health():
                 else None
             ),
         },
+    }
+
+@app.get("/api/settings")
+async def get_settings():
+    return {
+        "upload": {
+            "max_size_mb": settings.max_upload_mb,
+            "supported_formats": sorted(
+                extension.lstrip(".")
+                for extension in ALLOWED_EXTENSIONS
+            ),
+        },
+        "storage": {
+            "type": "local",
+        },
+        "ocr": {
+            "languages": settings.ocr_languages,
+            "dpi": settings.ocr_dpi,
+        },
+        "extraction": {
+            "media_crop_margin_pt": settings.media_crop_margin_pt,
+            "math_crop_dpi": settings.math_crop_dpi,
+        },
+        "ai": {
+            "provider": "ollama",
+            "enabled": settings.ollama_enabled,
+            "model": (
+                settings.ollama_model
+                if settings.ollama_enabled
+                else None
+            ),
+        },
+    }
+
+@app.get("/api/analytics/overview")
+async def analytics_overview():
+    return get_analytics_overview()
+
+@app.get("/api/documents")
+async def list_documents(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    jobs, total = list_jobs(limit=limit, offset=offset)
+
+    documents = []
+
+    for job in jobs:
+        result = job.get("result") or {}
+        document = result.get("document") or {}
+
+        documents.append(
+        {
+            "conversion_id": job.get("conversion_id"),
+            "status": job.get("status"),
+            "progress": job.get("progress", 0),
+            "stage": job.get("stage", ""),
+            "error": job.get("error"),
+            "filename": document.get("source_filename") or job.get("filename"),
+            "format": document.get("source_format") or job.get("format"),
+            "total_questions": document.get("total_questions"),
+            "total_pages": document.get("total_pages"),
+        }
+    )
+
+    return {
+        "items": documents,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/questions")
+async def list_questions(
+    search: str | None = Query(default=None, max_length=200),
+    question_type: str | None = Query(default=None, max_length=50),
+    review_required: bool | None = None,
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    jobs, _ = list_jobs(limit=10000, offset=0)
+
+    questions = []
+    normalized_search = search.strip().casefold() if search else None
+    normalized_type = question_type.strip().casefold() if question_type else None
+
+    for job in jobs:
+        if job.get("status") != "completed":
+            continue
+
+        result = job.get("result") or {}
+        document = result.get("document") or {}
+        filename = document.get("source_filename") or job.get("filename")
+
+        for section in result.get("sections") or []:
+            section_name = section.get("section_name")
+
+            for question in section.get("questions") or []:
+                question_text = question.get("question") or {}
+                searchable_text = " ".join(
+                    str(value)
+                    for value in (
+                        question_text.get("en"),
+                        question_text.get("hi"),
+                        question.get("question_number"),
+                    )
+                    if value is not None
+                ).casefold()
+
+                if normalized_search and normalized_search not in searchable_text:
+                    continue
+
+                if (
+                    normalized_type
+                    and str(question.get("question_type", "")).casefold()
+                    != normalized_type
+                ):
+                    continue
+
+                if (
+                    review_required is not None
+                    and question.get("review_required", False) != review_required
+                ):
+                    continue
+
+                questions.append(
+                    {
+                        **question,
+                        "section_name": section_name,
+                        "conversion_id": job.get("conversion_id"),
+                        "source_filename": filename,
+                    }
+                )
+
+    total = len(questions)
+
+    return {
+        "items": questions[offset:offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/review/questions")
+async def list_review_questions(
+    search: str | None = Query(default=None, max_length=200),
+    decision: Literal["pending", "approved", "rejected"] = "pending",
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    jobs, _ = list_jobs(limit=10000, offset=0)
+
+    questions = []
+    normalized_search = search.strip().casefold() if search else None
+
+    for job in jobs:
+        if job.get("status") != "completed":
+            continue
+
+        result = job.get("result") or {}
+        document = result.get("document") or {}
+        filename = document.get("source_filename") or job.get("filename")
+        decisions = job.get("review_decisions") or {}
+
+        for section in result.get("sections") or []:
+            section_name = section.get("section_name")
+
+            for question in section.get("questions") or []:
+                if not question.get("review_required", False):
+                    continue
+
+                question_id = question.get("question_id")
+                if not question_id:
+                    continue
+
+                saved_decision = decisions.get(question_id)
+                current_decision = (
+                    saved_decision.get("decision", "pending")
+                    if saved_decision
+                    else "pending"
+                )
+
+                if current_decision != decision:
+                    continue
+
+                question_text = question.get("question") or {}
+                searchable_text = " ".join(
+                    str(value)
+                    for value in (
+                        question_text.get("en"),
+                        question_text.get("hi"),
+                        question.get("question_number"),
+                        filename,
+                    )
+                    if value is not None
+                ).casefold()
+
+                if (
+                    normalized_search
+                    and normalized_search not in searchable_text
+                ):
+                    continue
+
+                questions.append(
+                    {
+                        **question,
+                        "section_name": section_name,
+                        "conversion_id": job.get("conversion_id"),
+                        "source_filename": filename,
+                        "review_decision": current_decision,
+                        "review_note": (
+                            saved_decision.get("note")
+                            if saved_decision
+                            else None
+                        ),
+                        "reviewed_at": (
+                            saved_decision.get("reviewed_at")
+                            if saved_decision
+                            else None
+                        ),
+                    }
+                )
+
+    total = len(questions)
+
+    return {
+        "items": questions[offset:offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+@app.get("/api/answer-keys")
+async def get_answer_keys(
+    search: str = "",
+    status: Literal[
+        "all",
+        "matched",
+        "unmatched",
+        "ambiguous",
+        "duplicate",
+        "conflicting",
+        "invalid",
+    ] = "all",
+    decision: Literal["all", "pending", "approved", "rejected"] = "all",
+    limit: int = 25,
+    offset: int = 0,
+):
+    if len(search) > 200:
+        raise HTTPException(status_code=422, detail="Search cannot exceed 200 characters.")
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="Limit must be between 1 and 100.")
+
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="Offset cannot be negative.")
+
+    normalized_search = search.strip().lower()
+    items = []
+
+    jobs, _ = list_jobs(limit=10000, offset=0)
+
+    for job in jobs:
+        if job.get("status") != "completed":
+            continue
+
+        answer_key = job.get("answer_key") or {}
+
+        if not answer_key.get("provided"):
+            continue
+
+        conversion_id = job.get("conversion_id")
+        filename = answer_key.get("filename")
+        decisions = job.get("answer_key_decisions") or {}
+
+        for entry in answer_key.get("entries") or []:
+            entry_id = entry.get("entry_id")
+            saved_decision = decisions.get(entry_id) or {}
+            current_decision = saved_decision.get("decision", "pending")
+
+            if status != "all" and entry.get("status") != status:
+                continue
+
+            if decision != "all" and current_decision != decision:
+                continue
+
+            if normalized_search:
+                searchable_text = " ".join(
+                    str(value or "")
+                    for value in (
+                        filename,
+                        entry.get("question_number"),
+                        entry.get("answer"),
+                        entry.get("status"),
+                    )
+                ).lower()
+
+                if normalized_search not in searchable_text:
+                    continue
+
+            items.append({
+                **entry,
+                "conversion_id": conversion_id,
+                "source_filename": filename,
+                "review_decision": current_decision,
+                "corrected_answer": saved_decision.get("corrected_answer"),
+                "review_note": saved_decision.get("note"),
+                "reviewed_at": saved_decision.get("reviewed_at"),
+            })
+
+    items.sort(
+        key=lambda item: (
+            item.get("source_filename") or "",
+            item.get("question_number") or "",
+        )
+    )
+
+    total = len(items)
+
+    return {
+        "items": items[offset:offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+@app.patch("/api/answer-keys/{conversion_id}/entries/{entry_id}")
+async def update_answer_key_decision(
+    conversion_id: str,
+    entry_id: str,
+    payload: AnswerKeyDecisionRequest,
+):
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        saved_decision = save_answer_key_decision(
+            conversion_id=conversion_id,
+            entry_id=entry_id,
+            decision=payload.decision,
+            corrected_answer=payload.corrected_answer,
+            note=payload.note,
+            reviewed_at=reviewed_at,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Conversion not found.")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Answer-key entry not found.")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+    return {
+        "conversion_id": conversion_id,
+        "entry_id": entry_id,
+        **saved_decision,
+    }
+
+
+@app.post("/api/conversions/{conversion_id}/publish")
+async def publish_conversion(conversion_id: str):
+    try:
+        return create_publication(conversion_id)
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversion not found.",
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=str(error),
+        )
+
+
+@app.get("/api/conversions/{conversion_id}/publications")
+async def get_publications(conversion_id: str):
+    try:
+        publications = list_publications(conversion_id)
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversion not found.",
+        )
+
+    return {
+        "items": publications,
+        "total": len(publications),
+    }
+
+
+@app.get("/api/conversions/{conversion_id}/publications/{version}")
+async def get_publication(
+    conversion_id: str,
+    version: int,
+):
+    try:
+        return read_publication(conversion_id, version)
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Publication not found.",
+        )
+
+
+@app.patch(
+    "/api/review/questions/{conversion_id}/{question_id}"
+)
+async def update_review_question(
+    conversion_id: str,
+    question_id: str,
+    payload: ReviewDecisionRequest,
+):
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        saved_decision = save_review_decision(
+            conversion_id=conversion_id,
+            question_id=question_id,
+            decision=payload.decision,
+            note=payload.note.strip() if payload.note else None,
+            reviewed_at=reviewed_at,
+        )
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversion not found.",
+        )
+
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail="Question not found.",
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=409,
+            detail="Conversion is not completed.",
+        )
+
+    return {
+        "conversion_id": conversion_id,
+        "question_id": question_id,
+        **saved_decision,
     }
 
 
@@ -145,6 +615,14 @@ async def convert(
         )
 
     conversion_id, root = create_job()
+
+    question_paper_name = question_papers[0]
+
+    update_job(
+        conversion_id,
+        filename=question_paper_name,
+        format=Path(question_paper_name).suffix.lstrip(".").lower(),
+    )
     logger.info("Conversion %s accepted; roles=%s", conversion_id, effective_roles)
 
     saved_files = []
