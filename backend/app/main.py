@@ -14,9 +14,15 @@ from contextlib import asynccontextmanager
 from app import database
 from app.routers.auth import router as auth_router
 
+from app.dependencies.auth import (
+    AuthenticatedPrincipal,
+    get_current_principal,
+)
+
 import httpx
 from fastapi import (
     BackgroundTasks,
+    Depends,
     FastAPI,
     File,
     Form,
@@ -40,8 +46,11 @@ from app.storage import (
     list_publications,
     read_publication,
     get_analytics_overview,
+    read_job_for_organization,
+    job_dir_for_organization,
 )
 from app.services.engine import run_conversion
+from app.dependencies.security import require_csrf
 
 
 logging.basicConfig(level=logging.INFO)
@@ -160,15 +169,24 @@ async def get_settings():
     }
 
 @app.get("/api/analytics/overview")
-async def analytics_overview():
-    return get_analytics_overview()
+async def analytics_overview(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    return get_analytics_overview(
+        organization_id=principal.organization_id
+    )
 
 @app.get("/api/documents")
 async def list_documents(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    jobs, total = list_jobs(limit=limit, offset=offset)
+    jobs, total = list_jobs(
+        limit=limit,
+        offset=offset,
+        organization_id=principal.organization_id,
+    )
 
     documents = []
 
@@ -205,8 +223,13 @@ async def list_questions(
     review_required: bool | None = None,
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    jobs, _ = list_jobs(limit=10000, offset=0)
+    jobs, _ = list_jobs(
+        limit=10000,
+        offset=0,
+        organization_id=principal.organization_id,
+    )
 
     questions = []
     normalized_search = search.strip().casefold() if search else None
@@ -276,8 +299,13 @@ async def list_review_questions(
     decision: Literal["pending", "approved", "rejected"] = "pending",
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    jobs, _ = list_jobs(limit=10000, offset=0)
+    jobs, _ = list_jobs(
+        limit=10000,
+        offset=0,
+        organization_id=principal.organization_id,
+    )
 
     questions = []
     normalized_search = search.strip().casefold() if search else None
@@ -374,6 +402,7 @@ async def get_answer_keys(
     decision: Literal["all", "pending", "approved", "rejected"] = "all",
     limit: int = 25,
     offset: int = 0,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     if len(search) > 200:
         raise HTTPException(status_code=422, detail="Search cannot exceed 200 characters.")
@@ -387,7 +416,11 @@ async def get_answer_keys(
     normalized_search = search.strip().lower()
     items = []
 
-    jobs, _ = list_jobs(limit=10000, offset=0)
+    jobs, _ = list_jobs(
+        limit=10000,
+        offset=0,
+        organization_id=principal.organization_id,
+    )
 
     for job in jobs:
         if job.get("status") != "completed":
@@ -458,10 +491,16 @@ async def update_answer_key_decision(
     conversion_id: str,
     entry_id: str,
     payload: AnswerKeyDecisionRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    csrf: None = Depends(require_csrf),
 ):
     reviewed_at = datetime.now(timezone.utc).isoformat()
 
     try:
+        read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
         saved_decision = save_answer_key_decision(
             conversion_id=conversion_id,
             entry_id=entry_id,
@@ -483,10 +522,17 @@ async def update_answer_key_decision(
         **saved_decision,
     }
 
-
 @app.post("/api/conversions/{conversion_id}/publish")
-async def publish_conversion(conversion_id: str):
+async def publish_conversion(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    csrf: None = Depends(require_csrf),
+):
     try:
+        read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
         return create_publication(conversion_id)
 
     except FileNotFoundError:
@@ -501,10 +547,16 @@ async def publish_conversion(conversion_id: str):
             detail=str(error),
         )
 
-
 @app.get("/api/conversions/{conversion_id}/publications")
-async def get_publications(conversion_id: str):
+async def get_publications(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
     try:
+        read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
         publications = list_publications(conversion_id)
 
     except FileNotFoundError:
@@ -523,8 +575,13 @@ async def get_publications(conversion_id: str):
 async def get_publication(
     conversion_id: str,
     version: int,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     try:
+        read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
         return read_publication(conversion_id, version)
 
     except FileNotFoundError:
@@ -533,7 +590,6 @@ async def get_publication(
             detail="Publication not found.",
         )
 
-
 @app.patch(
     "/api/review/questions/{conversion_id}/{question_id}"
 )
@@ -541,10 +597,16 @@ async def update_review_question(
     conversion_id: str,
     question_id: str,
     payload: ReviewDecisionRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    csrf: None = Depends(require_csrf),
 ):
     reviewed_at = datetime.now(timezone.utc).isoformat()
 
     try:
+        read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
         saved_decision = save_review_decision(
             conversion_id=conversion_id,
             question_id=question_id,
@@ -584,6 +646,8 @@ async def convert(
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
     roles: str = Form("{}"),
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    csrf: None = Depends(require_csrf),
 ):
     uploads = files or ([file] if file else [])
 
@@ -631,7 +695,10 @@ async def convert(
             detail="Upload exactly one question paper and optionally one answer key.",
         )
 
-    conversion_id, root = create_job()
+    conversion_id, root = create_job(
+        organization_id=principal.organization_id,
+        created_by=principal.user_id,
+    )
 
     question_paper_name = question_papers[0]
 
@@ -732,9 +799,15 @@ async def convert(
 
 
 @app.get("/api/conversions/{conversion_id}")
-async def status(conversion_id: str):
+async def status(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
     try:
-        return read_job(conversion_id)
+        return read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -742,12 +815,20 @@ async def status(conversion_id: str):
             detail="Conversion not found.",
         )
 
-
 @app.get("/api/conversions/{conversion_id}/json")
-async def download_json(conversion_id: str):
+async def download_json(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
     try:
-        data = read_job(conversion_id)
-        root = job_dir(conversion_id)
+        data = read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
+        root = job_dir_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -780,10 +861,19 @@ async def download_json(conversion_id: str):
 
 
 @app.get("/api/conversions/{conversion_id}/zip")
-async def download_zip(conversion_id: str):
+async def download_zip(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+):
     try:
-        data = read_job(conversion_id)
-        root = job_dir(conversion_id)
+        data = read_job_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
+        root = job_dir_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -856,6 +946,7 @@ async def download_zip(conversion_id: str):
 async def media(
     conversion_id: str,
     filename: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     if (
         Path(filename).name != filename
@@ -867,7 +958,10 @@ async def media(
         )
 
     try:
-        root = job_dir(conversion_id)
+        root = job_dir_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -887,9 +981,16 @@ async def media(
 
 
 @app.delete("/api/conversions/{conversion_id}")
-async def delete_conversion(conversion_id: str):
+async def delete_conversion(
+    conversion_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    csrf: None = Depends(require_csrf),
+):
     try:
-        root = job_dir(conversion_id)
+        root = job_dir_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(

@@ -1,5 +1,6 @@
 
 import { createUploadFormData } from "../utils/uploadFormData";
+import { getCsrfHeaders } from "./csrfApi";
 
 export const API_BASE_URL = (
     import.meta.env.VITE_API_BASE_URL ??
@@ -17,7 +18,7 @@ export const ACCEPTED_EXTENSIONS = [
 ];
 
 export const NETWORK_ERROR =
-    "Cannot connect to the DocuJSON backend. Start the backend server at http://127.0.0.1:8000.";
+    "Cannot connect to the NEETDAY backend. Start the backend server at http://127.0.0.1:8000.";
 
 function extractDetail(body) {
     if (!body) return "";
@@ -54,7 +55,10 @@ async function requestJson(path, options = {}) {
     try {
         response = await fetch(
             `${API_BASE_URL}${path}`,
-            options
+            {
+                ...options,
+                credentials: "include",
+            }
         );
     } catch (error) {
         if (error.name === "AbortError") {
@@ -71,16 +75,34 @@ async function requestJson(path, options = {}) {
     return response.json();
 }
 
-export function uploadDocument(
+async function mutationHeaders(contentType = false) {
+    const csrfHeaders = await getCsrfHeaders(API_BASE_URL);
+
+    return {
+        ...(contentType
+            ? { "Content-Type": "application/json" }
+            : {}),
+        ...csrfHeaders,
+    };
+}
+
+export async function uploadDocument(
     files,
     { roles = {}, onProgress, signal } = {}
 ) {
+    const headers = await mutationHeaders();
+
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         const form = createUploadFormData(files, roles);
 
         xhr.open("POST", `${API_BASE_URL}/api/convert`);
+        xhr.withCredentials = true;
         xhr.responseType = "json";
+
+        Object.entries(headers).forEach(([name, value]) => {
+            xhr.setRequestHeader(name, value);
+        });
 
         xhr.upload.onprogress = (event) => {
             if (event.lengthComputable) {
@@ -184,22 +206,13 @@ export function getConversion(conversionId, signal) {
 }
 
 export async function deleteConversion(conversionId) {
-    let response;
-
-    try {
-        response = await fetch(
-            `${API_BASE_URL}/api/conversions/${encodeURIComponent(conversionId)}`,
-            { method: "DELETE" }
-        );
-    } catch {
-        throw new Error(NETWORK_ERROR);
-    }
-
-    if (!response.ok) {
-        throw new Error(await readError(response));
-    }
-
-    return response.json();
+    return requestJson(
+        `/api/conversions/${encodeURIComponent(conversionId)}`,
+        {
+            method: "DELETE",
+            headers: await mutationHeaders(),
+        }
+    );
 }
 
 export const jsonUrl = (conversionId) =>
@@ -223,7 +236,9 @@ export async function downloadFile(url, fallbackName) {
     let response;
 
     try {
-        response = await fetch(url);
+        response = await fetch(url, {
+            credentials: "include",
+        });
     } catch {
         throw new Error(NETWORK_ERROR);
     }
@@ -252,7 +267,6 @@ export async function downloadFile(url, fallbackName) {
         URL.revokeObjectURL(objectUrl);
     }, 1000);
 }
-
 
 export function getQuestions(
     {
@@ -312,7 +326,7 @@ export function getReviewQuestions(
     );
 }
 
-export function updateReviewDecision(
+export async function updateReviewDecision(
     conversionId,
     questionId,
     { decision, note = "" }
@@ -321,9 +335,7 @@ export function updateReviewDecision(
         `/api/review/questions/${encodeURIComponent(conversionId)}/${encodeURIComponent(questionId)}`,
         {
             method: "PATCH",
-            headers: {
-                "Content-Type": "application/json",
-            },
+            headers: await mutationHeaders(true),
             body: JSON.stringify({
                 decision,
                 note: note.trim() || null,
@@ -331,7 +343,6 @@ export function updateReviewDecision(
         }
     );
 }
-
 
 export function getAnswerKeys(
     {
@@ -360,7 +371,7 @@ export function getAnswerKeys(
     );
 }
 
-export function updateAnswerKeyDecision(
+export async function updateAnswerKeyDecision(
     conversionId,
     entryId,
     {
@@ -373,9 +384,7 @@ export function updateAnswerKeyDecision(
         `/api/answer-keys/${encodeURIComponent(conversionId)}/entries/${encodeURIComponent(entryId)}`,
         {
             method: "PATCH",
-            headers: {
-                "Content-Type": "application/json",
-            },
+            headers: await mutationHeaders(true),
             body: JSON.stringify({
                 decision,
                 corrected_answer: correctedAnswer.trim() || null,
@@ -385,13 +394,12 @@ export function updateAnswerKeyDecision(
     );
 }
 
-
-
-export function createPublication(conversionId) {
+export async function createPublication(conversionId) {
     return requestJson(
         `/api/conversions/${encodeURIComponent(conversionId)}/publish`,
         {
             method: "POST",
+            headers: await mutationHeaders(),
         }
     );
 }

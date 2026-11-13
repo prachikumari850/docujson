@@ -94,3 +94,36 @@ def mock_mongodb_for_api_tests(request, monkeypatch):
         "close_mongo_connection",
         mock_close,
     )
+
+@pytest.fixture(autouse=True)
+def authenticate_legacy_upload_regression_tests(request, monkeypatch):
+    if request.path.name not in {
+        "test_mcq_classification.py",
+        "test_srg_source_regression.py",
+    }:
+        return
+
+    from app.main import app
+    from app.dependencies.auth import (
+        AuthenticatedPrincipal,
+        get_current_principal,
+    )
+    from app.dependencies.security import require_csrf
+
+    principal = AuthenticatedPrincipal(
+        user_id="test-user-123",
+        organization_id="test-org-123",
+        role="owner",
+    )
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_current_principal,
+        lambda: principal,
+    )
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        require_csrf,
+        lambda: None,
+    )

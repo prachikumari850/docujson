@@ -1,21 +1,6 @@
 
 import { API_BASE_URL, NETWORK_ERROR } from "./converterApi";
-
-const CSRF_COOKIE = "neetday_csrf";
-
-let csrfToken = null;
-
-function readCookie(name) {
-    const prefix = `${name}=`;
-
-    const cookie = document.cookie
-        .split("; ")
-        .find((item) => item.startsWith(prefix));
-
-    return cookie
-        ? decodeURIComponent(cookie.slice(prefix.length))
-        : null;
-}
+import { getCsrfToken } from "./csrfApi";
 
 async function readError(response) {
     try {
@@ -62,23 +47,8 @@ async function request(path, options = {}) {
     return response.json();
 }
 
-async function getCsrfToken() {
-    const response = await request("/api/auth/csrf");
-
-    csrfToken = response.csrf_token;
-
-    const cookieToken = readCookie(CSRF_COOKIE);
-
-    if (!csrfToken || !cookieToken || csrfToken !== cookieToken) {
-        csrfToken = null;
-        throw new Error("Unable to initialize security token. Please retry.");
-    }
-
-    return csrfToken;
-}
-
 async function csrfRequest(path, body) {
-    const token = await getCsrfToken();
+    const token = await getCsrfToken(API_BASE_URL);
 
     return request(path, {
         method: "POST",
@@ -98,21 +68,17 @@ export function login(payload) {
     return csrfRequest("/api/auth/login", payload);
 }
 
-export async function getCurrentUser() {
+export function getCurrentUser() {
     return request("/api/auth/me");
 }
 
 export async function logout() {
-    const token = await getCsrfToken();
+    const token = await getCsrfToken(API_BASE_URL);
 
-    try {
-        return await request("/api/auth/logout", {
-            method: "POST",
-            headers: {
-                "X-CSRF-Token": token,
-            },
-        });
-    } finally {
-        csrfToken = null;
-    }
+    return request("/api/auth/logout", {
+        method: "POST",
+        headers: {
+            "X-CSRF-Token": token,
+        },
+    });
 }

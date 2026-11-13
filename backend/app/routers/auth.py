@@ -1,11 +1,15 @@
 
 from datetime import datetime, timedelta, timezone
-import hmac
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pymongo.errors import DuplicateKeyError
 
 from app.config import settings
+from app.dependencies.auth import (
+    SESSION_COOKIE,
+    get_auth_repository,
+)
+from app.dependencies.security import require_csrf
 from app.repositories.auth_repository import AuthRepository
 from app.schemas.auth import (
     AuthResponse,
@@ -14,7 +18,7 @@ from app.schemas.auth import (
     RegisterRequest,
     UserResponse,
 )
-from app.services.csrf import generate_csrf_token, verify_csrf_token
+from app.services.csrf import generate_csrf_token
 from app.services.security import (
     generate_session_token,
     hash_password,
@@ -25,12 +29,7 @@ from app.services.security import (
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
-SESSION_COOKIE = "neetday_session"
 CSRF_COOKIE = "neetday_csrf"
-
-
-def get_auth_repository() -> AuthRepository:
-    return AuthRepository()
 
 
 def set_csrf_cookie(response: Response, token: str) -> None:
@@ -72,22 +71,6 @@ def clear_auth_cookies(response: Response) -> None:
         httponly=False,
         samesite=settings.cookie_same_site,
     )
-
-
-def require_csrf(request: Request) -> None:
-    cookie_token = request.cookies.get(CSRF_COOKIE)
-    header_token = request.headers.get("X-CSRF-Token")
-
-    if (
-        not cookie_token
-        or not header_token
-        or not hmac.compare_digest(cookie_token, header_token)
-        or not verify_csrf_token(cookie_token)
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing CSRF token.",
-        )
 
 
 def build_auth_response(
@@ -169,13 +152,17 @@ def register(
             detail="An account with this email already exists.",
         )
 
-    user = registration["user"]
-    organization = registration["organization"]
-    membership = registration["membership"]
+    create_user_session(
+        response,
+        repository,
+        registration["user"]["_id"],
+    )
 
-    create_user_session(response, repository, user["_id"])
-
-    return build_auth_response(user, organization, membership)
+    return build_auth_response(
+        registration["user"],
+        registration["organization"],
+        registration["membership"],
+    )
 
 
 @router.post(

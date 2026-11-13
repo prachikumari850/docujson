@@ -21,7 +21,10 @@ def _validate_conversion_id(conversion_id: str) -> str:
     return conversion_id
 
 
-def create_job():
+def create_job(organization_id: str, created_by: str):
+    if not organization_id or not created_by:
+        raise ValueError("Organization and creator are required.")
+
     conversion_id = uuid4().hex
     root = settings.storage_path / conversion_id
 
@@ -31,6 +34,8 @@ def create_job():
         conversion_id,
         {
             "conversion_id": conversion_id,
+            "organization_id": organization_id,
+            "created_by": created_by,
             "status": "queued",
             "progress": 0,
             "stage": "Waiting to start",
@@ -78,8 +83,34 @@ def read_job(conversion_id: str) -> dict:
 
         return json.loads(path.read_text(encoding="utf-8"))
 
+def read_job_for_organization(
+    conversion_id: str,
+    organization_id: str,
+) -> dict:
+    if not organization_id:
+        raise FileNotFoundError("Conversion not found.")
 
-def list_jobs(limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
+    data = read_job(conversion_id)
+
+    if data.get("organization_id") != organization_id:
+        raise FileNotFoundError("Conversion not found.")
+
+    return data
+
+
+def job_dir_for_organization(
+    conversion_id: str,
+    organization_id: str,
+) -> Path:
+    read_job_for_organization(conversion_id, organization_id)
+    return job_dir(conversion_id)
+
+
+def list_jobs(
+    limit: int = 20,
+    offset: int = 0,
+    organization_id: str | None = None,
+) -> tuple[list[dict], int]:
     storage_root = settings.storage_path
     jobs = []
 
@@ -107,6 +138,12 @@ def list_jobs(limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
             if not isinstance(data, dict):
                 continue
 
+            if (
+                organization_id is not None
+                and data.get("organization_id") != organization_id
+            ):
+                continue
+
             data["_modified_at"] = modified_at
             jobs.append(data)
 
@@ -122,7 +159,6 @@ def list_jobs(limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
         job.pop("_modified_at", None)
 
     return page, total
-
 
 def update_job(conversion_id: str, **values):
     with LOCK:
@@ -420,8 +456,15 @@ def read_publication(conversion_id: str, version: int) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
 
-def get_analytics_overview() -> dict:
-    jobs, total_jobs = list_jobs(limit=10000, offset=0)
+def get_analytics_overview(organization_id: str) -> dict:
+    if not organization_id:
+        raise ValueError("Organization ID is required.")
+
+    jobs, total_jobs = list_jobs(
+        limit=10000,
+        offset=0,
+        organization_id=organization_id,
+    )
 
     document_status = {
         "completed": 0,

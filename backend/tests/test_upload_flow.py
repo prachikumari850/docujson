@@ -9,14 +9,35 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
-from app.storage import read_job, update_job
+from app.storage import create_job, read_job, update_job
+
+from app.dependencies.auth import (
+    AuthenticatedPrincipal,
+    get_current_principal,
+)
+
+from app.dependencies.security import require_csrf
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_dir", str(tmp_path / "storage"))
     monkeypatch.setattr(settings, "max_upload_mb", 1)
-    with TestClient(app) as test_client:
-        yield test_client
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="test-user-123",
+            organization_id="test-org-123",
+            role="owner",
+        )
+    )
+    app.dependency_overrides[require_csrf] = lambda: None
+
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_current_principal, None)
+        app.dependency_overrides.pop(require_csrf, None)
 
 
 def make_docx():
@@ -1172,3 +1193,331 @@ def test_invalid_answer_key_correction_excludes_question(client):
 
     assert entry["matched_question_id"] not in published_ids
     assert publication["total_questions"] == 1
+
+def test_documents_list_only_returns_authenticated_organizations_jobs(
+    client,
+):
+    organization_a_upload = upload(client, "organization-a.txt")
+
+    assert organization_a_upload.status_code == 200
+
+    organization_a_id = organization_a_upload.json()["conversion_id"]
+
+    organization_b_id, _ = create_job(
+        organization_id="org-b",
+        created_by="user-b",
+    )
+
+    listing = client.get("/api/documents")
+
+    assert listing.status_code == 200
+
+    data = listing.json()
+    conversion_ids = {
+        item["conversion_id"]
+        for item in data["items"]
+    }
+
+    assert data["total"] == 1
+    assert organization_a_id in conversion_ids
+    assert organization_b_id not in conversion_ids
+
+def test_other_organization_cannot_access_document_status(client):
+    organization_a_upload = upload(client, "organization-a.txt")
+
+    assert organization_a_upload.status_code == 200
+
+    organization_a_id = organization_a_upload.json()["conversion_id"]
+
+    response = client.get(
+        f"/api/conversions/{organization_a_id}"
+    )
+
+    assert response.status_code == 200
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        response = client.get(
+            f"/api/conversions/{organization_a_id}"
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Conversion not found."
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_other_organization_cannot_download_or_delete_document(client):
+    upload_response = upload(client, "organization-a.txt")
+
+    assert upload_response.status_code == 200
+
+    conversion_id = upload_response.json()["conversion_id"]
+
+    root = settings.storage_path / conversion_id
+    media_dir = root / "media"
+    media_dir.mkdir(exist_ok=True)
+    (media_dir / "private.png").write_bytes(b"private media")
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        assert client.get(
+            f"/api/conversions/{conversion_id}/json"
+        ).status_code == 404
+
+        assert client.get(
+            f"/api/conversions/{conversion_id}/zip"
+        ).status_code == 404
+
+        assert client.get(
+            f"/api/conversions/{conversion_id}/media/private.png"
+        ).status_code == 404
+
+        delete_response = client.delete(
+            f"/api/conversions/{conversion_id}"
+        )
+
+        assert delete_response.status_code == 404
+        assert root.exists()
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_other_organization_cannot_view_or_update_review_question(client):
+    response = upload(
+        client,
+        "review-private.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+    assert response.status_code == 200
+
+    conversion_id = response.json()["conversion_id"]
+    job = read_job(conversion_id)
+
+    question = next(
+        question
+        for section in job["result"]["sections"]
+        for question in section["questions"]
+    )
+
+    question["review_required"] = True
+    update_job(conversion_id, result=job["result"])
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        listing = client.get("/api/review/questions")
+
+        assert listing.status_code == 200
+        assert listing.json()["total"] == 0
+
+        decision = client.patch(
+            f"/api/review/questions/{conversion_id}/{question['question_id']}",
+            json={
+                "decision": "approved",
+                "note": "Unauthorized review attempt.",
+            },
+        )
+
+        assert decision.status_code == 404
+
+        stored_job = read_job(conversion_id)
+        assert question["question_id"] not in stored_job.get(
+            "review_decisions", {}
+        )
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_other_organization_cannot_view_or_update_answer_key(client):
+    conversion_id = upload_with_answer_key(client)
+
+    listing = client.get("/api/answer-keys")
+    assert listing.status_code == 200
+
+    entry = listing.json()["items"][0]
+    entry_id = entry["entry_id"]
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        response = client.get("/api/answer-keys")
+
+        assert response.status_code == 200
+        assert response.json()["total"] == 0
+
+        response = client.patch(
+            f"/api/answer-keys/{conversion_id}/entries/{entry_id}",
+            json={
+                "decision": "approved",
+                "corrected_answer": "4",
+                "note": "Unauthorized correction.",
+            },
+        )
+
+        assert response.status_code == 404
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_other_organization_cannot_view_or_create_publications(client):
+    response = upload(
+        client,
+        "publish-private.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+    assert response.status_code == 200
+
+    conversion_id = response.json()["conversion_id"]
+
+    publish_response = client.post(
+        f"/api/conversions/{conversion_id}/publish"
+    )
+    assert publish_response.status_code == 200
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        response = client.get(
+            f"/api/conversions/{conversion_id}/publications"
+        )
+        assert response.status_code == 404
+
+        response = client.get(
+            f"/api/conversions/{conversion_id}/publications/1"
+        )
+        assert response.status_code == 404
+
+        response = client.post(
+            f"/api/conversions/{conversion_id}/publish"
+        )
+        assert response.status_code == 404
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_other_organization_cannot_view_questions(client):
+    response = upload(
+        client,
+        "private-questions.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+    assert response.status_code == 200
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    app.dependency_overrides[get_current_principal] = lambda: (
+        AuthenticatedPrincipal(
+            user_id="user-b",
+            organization_id="org-b",
+            role="owner",
+        )
+    )
+
+    try:
+        listing = client.get("/api/questions")
+
+        assert listing.status_code == 200
+        assert listing.json()["total"] == 0
+        assert listing.json()["items"] == []
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
+
+def test_analytics_only_includes_authenticated_organization(client):
+    own_upload = upload(
+        client,
+        "organization-a.txt",
+        b"1. What is photosynthesis?\n"
+        b"A. Respiration\n"
+        b"B. Food production in plants\n"
+        b"C. Digestion\n"
+        b"D. Transpiration",
+    )
+    assert own_upload.status_code == 200
+
+    other_conversion_id, _ = create_job(
+        organization_id="org-b",
+        created_by="user-b",
+    )
+
+    original_principal = app.dependency_overrides[get_current_principal]
+
+    try:
+        organization_a = client.get("/api/analytics/overview")
+        assert organization_a.status_code == 200
+        assert organization_a.json()["documents"]["total"] == 1
+
+        app.dependency_overrides[get_current_principal] = lambda: (
+            AuthenticatedPrincipal(
+                user_id="user-b",
+                organization_id="org-b",
+                role="owner",
+            )
+        )
+
+        organization_b = client.get("/api/analytics/overview")
+        assert organization_b.status_code == 200
+        assert organization_b.json()["documents"]["total"] == 1
+
+        assert (
+            organization_a.json()["recent_documents"][0]["conversion_id"]
+            != other_conversion_id
+        )
+
+    finally:
+        app.dependency_overrides[get_current_principal] = original_principal
