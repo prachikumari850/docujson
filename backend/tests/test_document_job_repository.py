@@ -228,3 +228,31 @@ def test_delete_job_removes_only_matching_organization_job(repository):
     assert repository.documents.find_one(
         {"_id": "a" * 32}
     ) is None
+
+def test_update_job_persists_failed_status_and_error(repository):
+    create_test_job(repository)
+
+    job = repository.update_job(
+        "a" * 32,
+        {
+            "status": "failed",
+            "progress": 100,
+            "stage": "Conversion failed",
+            "error": "Document extraction failed.",
+            "result": None,
+        },
+    )
+
+    assert job["status"] == "failed"
+    assert job["progress"] == 100
+    assert job["stage"] == "Conversion failed"
+    assert job["error"] == "Document extraction failed."
+    assert job["result"] is None
+
+    document = repository.documents.find_one(
+        {"_id": "a" * 32}
+    )
+
+    assert document["status"] == "failed"
+    assert document["progress"] == 100
+    assert document["stage"] == "Conversion failed"
