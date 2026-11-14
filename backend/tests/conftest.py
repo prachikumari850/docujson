@@ -15,6 +15,7 @@ from app import database
 
 import mongomock
 from app.database_indexes import ensure_indexes
+from app.celery_app import celery_app
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -90,6 +91,8 @@ def mock_mongodb_for_api_tests(request, monkeypatch):
     ensure_indexes(mongo_database)
 
     def mock_connect():
+        monkeypatch.setitem(celery_app.conf, "task_always_eager", True)
+        monkeypatch.setitem(celery_app.conf, "task_eager_propagates", True)
         database.mongo_client = mongo_client
         database.mongo_database = mongo_database
         return mongo_database

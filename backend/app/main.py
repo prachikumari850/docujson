@@ -24,7 +24,6 @@ from app.dependencies.auth import (
 
 import httpx
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -53,7 +52,7 @@ from app.storage import (
     job_dir_for_organization,
     delete_job
 )
-from app.services.engine import run_conversion
+from app.tasks.conversion import process_conversion
 from app.dependencies.security import require_csrf
 
 
@@ -658,7 +657,6 @@ async def update_review_question(
 
 @app.post("/api/convert")
 async def convert(
-    background: BackgroundTasks,
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
     roles: str = Form("{}"),
@@ -711,7 +709,7 @@ async def convert(
             detail="Upload exactly one question paper and optionally one answer key.",
         )
 
-    conversion_id, root = create_job(
+    conversion_id, _ = create_job(
         organization_id=principal.organization_id,
         created_by=principal.user_id,
     )
@@ -795,17 +793,25 @@ async def convert(
 
             await upload.close()
 
-        background.add_task(
-            run_conversion,
-            conversion_id,
-            saved_files,
-            role_map,
-            root,
-            source_name_map,
-        )
-        logger.info("Conversion %s queued with %d files", conversion_id, len(saved_files))
+        
+        queued_job = read_job(conversion_id)
 
-        return read_job(conversion_id)
+        task = process_conversion.delay(
+            conversion_id=conversion_id,
+            source_filenames=[path.name for path in saved_files],
+            role_map=role_map,
+            source_name_map=source_name_map,
+        )
+
+        logger.info(
+            "Conversion queued: conversion=%s task_id=%s files=%d",
+            conversion_id,
+            task.id,
+            len(saved_files),
+        )
+
+        return queued_job
+
 
     except Exception:
         logger.exception(

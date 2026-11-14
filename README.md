@@ -112,3 +112,8 @@ If the source PDF is outside the repository, set `DOCUJSON_PHYSICS_QP_PDF` to it
 ## Known validation limits
 
 The preserved SRG Physics and Chemistry papers are from the same publisher family. They are useful regression sources, not evidence of universal or cross-publisher compatibility. Other-publisher physics, mathematics, chemistry, Hindi/bilingual, multi-column, image-option, and genuine scanned MCQ exam samples are still needed for broader accuracy claims. OCR performance depends on image quality and installed language data. Review flags and source comparison remain important for ambiguous content.
+
+
+# How to start celeary server
+cd backend with activated server
+celery -A app.celery_app:celery_app worker --loglevel=INFO --pool=solo

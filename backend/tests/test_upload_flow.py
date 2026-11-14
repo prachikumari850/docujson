@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.main import app
 from app.storage import create_job, read_job, update_job
+from app.celery_app import celery_app
 
 from app.dependencies.auth import (
     AuthenticatedPrincipal,
@@ -22,6 +23,8 @@ from app.dependencies.security import require_csrf
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_dir", str(tmp_path / "storage"))
     monkeypatch.setattr(settings, "max_upload_mb", 1)
+    monkeypatch.setitem(celery_app.conf, "task_always_eager", True)
+    monkeypatch.setitem(celery_app.conf, "task_eager_propagates", True)
 
     app.dependency_overrides[get_current_principal] = lambda: (
         AuthenticatedPrincipal(

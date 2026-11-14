@@ -11,3 +11,4 @@ pytesseract>=0.3.13
 httpx>=0.27.0
 pytest>=8.0.0
 argon2-cffi>=23.1,<26
+celery[redis]>=5.4,<6

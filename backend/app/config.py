@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     storage_dir: str = "../storage"
     mongodb_uri: str = "mongodb://localhost:27017"
     mongodb_database: str = "neetday"
+    redis_url: str = "redis://localhost:6379/0"
     max_upload_mb: int = Field(default=50, gt=0)
 
     session_expire_hours: int = Field(default=24, gt=0, le=720)
