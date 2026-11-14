@@ -1,6 +1,6 @@
 from app.services.engine import parse_questions, attach_media, _line_text_from_spans, _ordered_layout_lines, _cluster_drawing_rectangles, _spatial_reflow_fragments, _text_quality, repair_pdf_mojibake, _reconstruct_stacked_fractions, _has_encoding_artifacts, _has_suspicious_math_layout, _SUPERSCRIPTS, _SUBSCRIPTS, _associate_detached_vector_marks, numbered_options, bilingual
 import fitz
-from app.services.engine import extract_pdf
+from app.services.engine import extract_pdf , _roman_to_int , match_question_label
 
 
 def test_bilingual_fields_retain_shared_math_only_source_lines():
@@ -540,3 +540,173 @@ def test_blank_graph_option_gets_a_tightly_cropped_source_asset(tmp_path):
     assert option["media"]
     crop = fitz.Rect(option["media"][0]["bbox"])
     assert crop.width < 300 and crop.height < 100
+
+def test_question_and_options_continue_across_pdf_pages():
+    pages = [
+        {
+            "page": 1,
+            "text": (
+                "SECTION A\n"
+                "1. Which of the following statements is correct?\n"
+                "Consider the properties of the given material."
+            ),
+        },
+        {
+            "page": 2,
+            "text": (
+                "The remaining details are given below.\n"
+                "(1) First option\n"
+                "(2) Second option\n"
+                "(3) Third option\n"
+                "(4) Fourth option\n"
+                "2. Select the correct answer.\n"
+                "(1) Alpha\n"
+                "(2) Beta\n"
+                "(3) Gamma\n"
+                "(4) Delta"
+            ),
+        },
+    ]
+
+    sections = parse_questions(pages)
+    questions = [
+        question
+        for section in sections
+        for question in section["questions"]
+    ]
+
+    assert [q["question_number"] for q in questions] == [1, 2]
+
+    first = questions[0]
+
+    assert "Which of the following statements is correct?" in first["question"]["en"]
+    assert "Consider the properties" in first["question"]["en"]
+    assert "remaining details" in first["question"]["en"]
+
+    assert [
+        (option["id"], option["text"])
+        for option in first["options"]
+    ] == [
+        ("1", "First option"),
+        ("2", "Second option"),
+        ("3", "Third option"),
+        ("4", "Fourth option"),
+    ]
+
+    assert first["question_type"] == "mcq"
+    assert "Select the correct answer." in questions[1]["question"]["en"]
+
+def test_option_text_continues_across_pdf_pages():
+    pages = [
+        {
+            "page": 1,
+            "text": (
+                "SECTION A\n"
+                "1. Which statement is correct?\n"
+                "(1) First option begins here\n"
+                "(2) Second option"
+            ),
+        },
+        {
+            "page": 2,
+            "text": (
+                "and continues on the next page\n"
+                "(3) Third option\n"
+                "(4) Fourth option\n"
+                "2. Select the correct answer.\n"
+                "(1) Alpha\n"
+                "(2) Beta\n"
+                "(3) Gamma\n"
+                "(4) Delta"
+            ),
+        },
+    ]
+
+    sections = parse_questions(pages)
+    questions = [
+        question
+        for section in sections
+        for question in section["questions"]
+    ]
+
+    first = questions[0]
+    first_option = next(
+        option for option in first["options"] if option["id"] == "2"
+    )
+
+    assert "Second option" in first_option["text"]
+    assert "continues on the next page" in first_option["text"]
+    assert [option["id"] for option in first["options"]] == ["1", "2", "3", "4"]
+
+def test_repeated_section_heading_across_pages_does_not_duplicate_section():
+    pages = [
+        {
+            "page": 1,
+            "text": (
+                "SECTION A\n"
+                "1. First question?\n"
+                "(1) A\n(2) B\n(3) C\n(4) D"
+            ),
+        },
+        {
+            "page": 2,
+            "text": (
+                "SECTION A\n"
+                "2. Second question?\n"
+                "(1) A\n(2) B\n(3) C\n(4) D"
+            ),
+        },
+    ]
+
+    sections = parse_questions(pages)
+
+    assert len(sections) == 1
+    assert sections[0]["section_name"] == "Section A"
+    assert [
+        question["question_number"]
+        for question in sections[0]["questions"]
+    ] == [1, 2]
+
+def test_roman_to_int_converts_valid_numerals():
+    assert _roman_to_int("I") == 1
+    assert _roman_to_int("IV") == 4
+    assert _roman_to_int("IX") == 9
+    assert _roman_to_int("XL") == 40
+    assert _roman_to_int("XC") == 90
+    assert _roman_to_int("CD") == 400
+    assert _roman_to_int("CM") == 900
+    assert _roman_to_int("MMMCMXCIX") == 3999
+
+
+def test_roman_to_int_rejects_invalid_numerals():
+    assert _roman_to_int("IIII") is None
+    assert _roman_to_int("VX") is None
+    assert _roman_to_int("IC") is None
+    assert _roman_to_int("") is None
+
+def test_roman_numbered_questions_are_parsed():
+    pages = [{
+        "page": 1,
+        "text": (
+            "SECTION A\n"
+            "I. First question\n"
+            "(1) One\n(2) Two\n(3) Three\n(4) Four\n"
+            "II. Second question\n"
+            "(1) One\n(2) Two\n(3) Three\n(4) Four\n"
+            "III. Third question\n"
+            "(1) One\n(2) Two\n(3) Three\n(4) Four"
+        ),
+    }]
+
+    questions = [
+        q for section in parse_questions(pages)
+        for q in section["questions"]
+    ]
+
+    assert [q["question_number"] for q in questions] == [1, 2, 3]
+    assert [q["question_label"] for q in questions] == ["I", "II", "III"]
+    assert all(len(q["options"]) == 4 for q in questions)
+
+
+def test_invalid_roman_question_label_is_not_recognized():
+    assert match_question_label("IIII. Invalid question") is None

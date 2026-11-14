@@ -2,10 +2,11 @@
 import re
 from collections import defaultdict
 from typing import Any
-
+from app.services.question_labels import question_label_to_number 
 
 INDIVIDUAL_ANSWER = re.compile(
-    r"^\s*(?:Q(?:UESTION)?\s*)?(\d{1,3})\s*[).:-]\s*([1-4A-D])\s*$",
+    r"^\s*(?:Q(?:UESTION)?\s*)?"
+    r"(\d{1,3}|[IVXLCDM]{1,12})\s*[).:-]\s*([1-4A-D])\s*$",
     re.IGNORECASE,
 )
 
@@ -97,8 +98,13 @@ def parse_answer_key(pages: list[dict[str, Any]]) -> dict[str, Any]:
 
             if question_row and not individual:
                 values = [
-                    int(value)
-                    for value in NUMBER.findall(question_row.group(1))
+                    number
+                    for value in re.findall(
+                        r"\b(?:\d{1,3}|[IVXLCDM]{1,12})\b",
+                        question_row.group(1),
+                        re.IGNORECASE,
+                    )
+                    if (number := question_label_to_number(value)) is not None
                 ]
 
                 if values:
@@ -134,12 +140,20 @@ def parse_answer_key(pages: list[dict[str, Any]]) -> dict[str, Any]:
                 if values:
                     continue
 
-            if pending_questions and re.fullmatch(r"[\s\d,;|]+", line):
+            if pending_questions and re.fullmatch(
+                r"[\s\d,;|IVXLCDM]+",
+                line,
+                re.IGNORECASE,
+            ):
                 continued_numbers = [
-                    int(value)
-                    for value in NUMBER.findall(line)
+                    number
+                    for value in re.findall(
+                        r"\b(?:\d{1,3}|[IVXLCDM]{1,12})\b",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if (number := question_label_to_number(value)) is not None
                 ]
-
                 if (
                     not awaiting_table_answers
                     and len(continued_numbers) >= 2
@@ -189,12 +203,15 @@ def parse_answer_key(pages: list[dict[str, Any]]) -> dict[str, Any]:
             individual = INDIVIDUAL_ANSWER.match(line)
 
             if individual:
-                add_entry(
-                    int(individual.group(1)),
-                    individual.group(2),
-                    page_number,
-                    "individual",
-                )
+                question_number = question_label_to_number(individual.group(1))
+
+                if question_number is not None:
+                    add_entry(
+                        question_number,
+                        individual.group(2),
+                        page_number,
+                        "individual",
+                    )
 
     answers: dict[int, str] = {}
 
@@ -249,3 +266,35 @@ def parse_answer_key(pages: list[dict[str, Any]]) -> dict[str, Any]:
         "entries": entries,
         "warnings": warnings,
     }
+
+def test_roman_numbered_individual_answers():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "I. A\nII) B\nQIII - C"}
+    ])
+
+    assert parsed["answers"] == {
+        1: "A",
+        2: "B",
+        3: "C",
+    }
+
+
+def test_roman_numbered_table_answers():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "Q. I II\nIII IV\nA. 1 2 3 4"}
+    ])
+
+    assert parsed["answers"] == {
+        1: "1",
+        2: "2",
+        3: "3",
+        4: "4",
+    }
+
+
+def test_invalid_roman_answer_label_is_ignored():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "IIII. A"}
+    ])
+
+    assert parsed["answers"] == {} 

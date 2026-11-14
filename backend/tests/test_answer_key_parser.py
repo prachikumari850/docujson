@@ -99,3 +99,29 @@ def test_parser_marks_conflicting_entries_in_structured_output():
         entry["status"] == "conflicting"
         for entry in parsed["entries"]
     )
+
+
+def test_roman_numbered_individual_answers():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "I. A\nII) B\nQIII - C"}
+    ])
+
+    assert parsed["answers"] == {1: "A", 2: "B", 3: "C"}
+
+
+def test_roman_numbered_table_answers():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "Q. I II\nIII IV\nA. 1 2 3 4"}
+    ])
+
+    assert parsed["answers"] == {
+        1: "1", 2: "2", 3: "3", 4: "4"
+    }
+
+
+def test_invalid_roman_answer_label_is_ignored():
+    parsed = parse_answer_key([
+        {"page": 1, "text": "IIII. A"}
+    ])
+
+    assert parsed["answers"] == {}

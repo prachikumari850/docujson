@@ -18,6 +18,7 @@ import pytesseract
 from app.config import settings
 from app.models import DocumentResult
 from app.ir import child_id as ir_child_id, question_id as ir_question_id
+from app.services.question_labels import question_label_to_number, roman_to_int
 from app.storage import update_job
 from app.services.answer_key import parse_answer_key
 from app.services.svg_render import attach_raster_svg_wrappers, reconstruct_pdf_vector_svg
@@ -26,11 +27,48 @@ from app.services.vision import verify_math_image
 
 logger = logging.getLogger("docujson")
 
+ROMAN_NUMERAL_RE = re.compile(
+    r"^(?=.)M{0,3}(CM|CD|D?C{0,3})"
+    r"(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$",
+    re.IGNORECASE,
+)
+
+def _roman_to_int(value: str) -> int | None:
+    return roman_to_int(value)
+
 
 QUESTION_RE = re.compile(
     r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[).:](?=\s|$)\s*(.*)$",
     re.IGNORECASE,
 )
+
+ROMAN_QUESTION_RE = re.compile(
+    r"^\s*(?:Q(?:uestion)?\.?\s*)?"
+    r"([IVXLCDM]{1,12})\s*[).:]\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def match_question_label(text: str):
+    """Return (numeric question number, original label, question text)."""
+
+    text = text.replace("\u00a0", " ").strip()
+
+    numeric_match = QUESTION_RE.match(text)
+    if numeric_match:
+        label = numeric_match.group(1)
+        return int(label), label, numeric_match.group(2).strip()
+
+
+    roman_match = ROMAN_QUESTION_RE.match(text)
+    if roman_match:
+        label = roman_match.group(1).upper()
+        number = question_label_to_number(label)
+
+        if number is not None:
+            return number, label, roman_match.group(2).strip()
+
+    return None
 
 OPTION_RE = re.compile(r"(?:\((\d{1,3})\)|\[(\d{1,3})\]|\(([A-Ha-h])\)|\[([A-Ha-h])\]|([A-Da-d])[).:])\s*")
 
@@ -1280,23 +1318,26 @@ def extract_pdf(path: Path, media_dir: Path):
 
             legacy_count = len(
                 re.findall(
-                    r"[\uF000-\uF8FF"
+                    r"[\uF000-\uF8FFï¢ï©ïªï«ï¬ïï®"
                     r"\uF0A0-\uF0FF]",
                     page_text,
                 )
             )
 
-            needs_ocr = (
-                legacy_count > max(
-                    8,
-                    int(len(page_text) * 0.08),
-                )
-                or len(page_text) < 30
-            )
             suspicious_glyphs = len(re.findall(r"[\ufffd\uF000-\uF8FF]", page_text))
-            useful_ratio = len(re.findall(r"[\w\u0900-\u097f]", page_text, flags=re.UNICODE)) / max(1, len(page_text))
-            needs_ocr = bool(len(page_text.strip()) < 60 or suspicious_glyphs >= 2 or (len(page_text) > 180 and useful_ratio < 0.42))
 
+            useful_ratio = (
+                len(re.findall(r"[\w\u0900-\u097f]", page_text, flags=re.UNICODE))
+                / max(1, len(page_text))
+            )
+
+            needs_ocr = bool(
+                legacy_count > max(8, int(len(page_text) * 0.08))
+                or len(page_text.strip()) < 60
+                or suspicious_glyphs >= 2
+                or (len(page_text) > 180 and useful_ratio < 0.42)
+            )
+            
             original_text = page_text
             ocr_text = ""
             ocr_warnings = []
@@ -1304,7 +1345,23 @@ def extract_pdf(path: Path, media_dir: Path):
             ocr_used = False
             if needs_ocr:
                 ocr_text, ocr_warnings, ocr_lines = _ocr_page(page, page_number, media_dir)
-                if ocr_text.strip() and _text_quality(original_text) < 0.55 and _text_quality(ocr_text) > _text_quality(original_text) + 0.08:
+                native_has_encoding_artifacts = _has_encoding_artifacts(original_text)
+
+                native_quality = _text_quality(original_text)
+                ocr_quality = _text_quality(ocr_text)
+
+                should_replace_with_ocr = (
+                    ocr_text.strip()
+                    and (
+                        native_has_encoding_artifacts
+                        or (
+                            native_quality < 0.55
+                            and ocr_quality > native_quality + 0.08
+                        )
+                    )
+                )
+
+                if should_replace_with_ocr:
                     ordered_lines, column_bounds = _ordered_layout_lines(ocr_lines, page_width)
                     column_texts = None
                     if column_bounds:
@@ -1844,9 +1901,15 @@ def parse_questions(pages: list[dict]):
         positioned_anchors = []
         page_option_anchors = []
         for anchor_line, anchor_bbox in page_lines:
-            anchor_match = QUESTION_RE.match(anchor_line.replace("\u00a0", " ").strip())
+            anchor_match = match_question_label(anchor_line)
+
             if anchor_match and anchor_bbox is not None:
-                positioned_anchors.append((int(anchor_match.group(1)), line_order_y.get(id(anchor_bbox), anchor_bbox.y0), (anchor_bbox.x0 + anchor_bbox.x1) / 2))
+                anchor_number, _, _ = anchor_match
+                positioned_anchors.append((
+                    anchor_number,
+                    line_order_y.get(id(anchor_bbox), anchor_bbox.y0),
+                    (anchor_bbox.x0 + anchor_bbox.x1) / 2,
+                ))
             if anchor_bbox is not None:
                 for parsed_option in numbered_options(anchor_line.replace("\u00a0", " ").strip()):
                     option_x = anchor_bbox.x0 + (parsed_option["offset"] / max(1, len(anchor_line))) * anchor_bbox.width
@@ -1887,13 +1950,13 @@ def parse_questions(pages: list[dict]):
                 started_questions = True
                 continue
 
-            question_match = QUESTION_RE.match(text)
+            question_match = match_question_label(text)
 
             if question_match:
                 if not started_questions:
                     continue
-                number = int(question_match.group(1))
-                initial_text = question_match.group(2).strip()
+
+                number, question_label, initial_text = question_match
                 explicitly_labeled = bool(re.match(r"^\s*(?:Q(?:uestion)?\.?\s*)\d", text, re.IGNORECASE))
                 is_next_question = number == expected_number or (
                     expected_number < number
@@ -1939,6 +2002,7 @@ def parse_questions(pages: list[dict]):
                 question = {
                     "question_id": f"q{number}",
                     "question_number": number,
+                    "question_label": question_label,
                     "question_type": "subjective",
                     "question": {
                         "en": None,
@@ -2122,7 +2186,7 @@ def parse_questions(pages: list[dict]):
                 nearby_prose = any(
                     other_bbox is not None
                     and other_text != text
-                    and not QUESTION_RE.match(other_text.strip())
+                    and not match_question_label(other_text.strip())
                     and not numbered_options(other_text.strip())
                     and len(re.findall(r"[A-Za-z]{2,}|[\u0900-\u097f]{2,}", other_text)) >= 3
                     and ((other_bbox.x0 + other_bbox.x1) / 2 >= page.get("width", 0) / 2)
@@ -2797,8 +2861,8 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
     next_question_rows = [
         float(line[0])
         for line in page_data.get("lines", [])
-        if (match := QUESTION_RE.match(line[2].replace("\u00a0", " ").strip()))
-        and int(match.group(1)) > int(question["question_number"])
+        if (match := match_question_label(line[2].replace("\u00a0", " ").strip()))
+        and match[0] > int(question["question_number"])
         and line[0] > marker.y0
         and (marker_column == "full" or _layout_column(line[3], page_width) in (marker_column, "full"))
     ]
@@ -2828,8 +2892,8 @@ def _crop_option_source(option, question, page_data, source_document, media_dir)
     next_questions = [
         float(line[0])
         for line in page_data.get("lines", [])
-        if (match := QUESTION_RE.match(line[2].replace("\u00a0", " ").strip()))
-        and int(match.group(1)) > int(question["question_number"])
+        if (match := match_question_label(line[2].replace("\u00a0", " ").strip()))
+        and match[0] > int(question["question_number"])
         and line[0] > marker.y0
         and (marker_column == "full" or _layout_column(line[3], page_width) in (marker_column, "full"))
     ]
@@ -2952,8 +3016,8 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
             column = region.get("column") or _layout_column(anchor, page_width)
             next_positions = []
             for line in page.get("lines", []):
-                match = QUESTION_RE.match(line[2].replace("\u00a0", " ").strip())
-                if not match or int(match.group(1)) <= number or line[0] <= anchor.y0:
+                match = match_question_label(line[2].replace("\u00a0", " ").strip())
+                if not match or match[0] <= number or line[0] <= anchor.y0:
                     continue
                 next_bbox = line[3]
                 next_column = _layout_column(next_bbox, page_width) if page_width else "full"
