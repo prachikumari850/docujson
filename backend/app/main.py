@@ -5,7 +5,10 @@ from pydantic import BaseModel, Field
 import json
 import logging
 import re
-import shutil
+from app.services.file_storage import (
+    save_upload,
+    delete_conversion_directory,
+)
 import zipfile
 from pathlib import Path
 
@@ -747,42 +750,48 @@ async def convert(
 
             role = effective_roles[original_name]
 
-            destination = (
-                root / f"input_{index}{extension}"
-            )
+            
+            destination_name = f"input_{index}{extension}"
 
-            with destination.open("wb") as output:
-                while True:
-                    chunk = await upload.read(
-                        1024 * 1024
+            try:
+                destination, total_size = await save_upload(
+                    conversion_id=conversion_id,
+                    filename=destination_name,
+                    upload=upload,
+                    max_bytes=maximum_size,
+                    current_total=total_size,
+                )
+            except ValueError as error:
+                if str(error) == "Upload size limit exceeded.":
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Combined upload exceeds "
+                            f"{settings.max_upload_mb} MB."
+                        ),
                     )
 
-                    if not chunk:
-                        break
+                if str(error) == "Uploaded file is empty.":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{original_name} is empty.",
+                    )
 
-                    total_size += len(chunk)
-
-                    if total_size > maximum_size:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"Combined upload exceeds "
-                                f"{settings.max_upload_mb} MB."
-                            ),
-                        )
-
-                    output.write(chunk)
-
-            if destination.stat().st_size == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{original_name} is empty.",
-                )
+                raise
 
             saved_files.append(destination)
             role_map[destination.name] = role
             source_name_map[destination.name] = original_name
-            logger.info("Validated upload: conversion=%s filename=%s role=%s size=%d destination=%s", conversion_id, original_name, role, destination.stat().st_size, destination)
+
+            logger.info(
+                "Validated upload: conversion=%s filename=%s "
+                "role=%s size=%d destination=%s",
+                conversion_id,
+                original_name,
+                role,
+                destination.stat().st_size,
+                destination,
+            )
 
             await upload.close()
 
@@ -811,8 +820,22 @@ async def convert(
             )
         except FileNotFoundError:
             pass
+        except Exception:
+            logger.warning(
+                "Failed to clean up database job for conversion %s",
+                conversion_id,
+                exc_info=True,
+            )
 
-        shutil.rmtree(root, ignore_errors=True)
+        try:
+            delete_conversion_directory(conversion_id)
+        except Exception:
+            logger.warning(
+                "Failed to clean up files for conversion %s",
+                conversion_id,
+                exc_info=True,
+            )
+
         raise
 
     finally:
@@ -1012,7 +1035,7 @@ async def delete_conversion(
     csrf: None = Depends(require_csrf),
 ):
     try:
-        root = job_dir_for_organization(
+        job_dir_for_organization(
             conversion_id,
             principal.organization_id,
         )
@@ -1028,7 +1051,17 @@ async def delete_conversion(
             detail="Conversion not found.",
         )
 
-    shutil.rmtree(root, ignore_errors=True)
+    try:
+        delete_conversion_directory(conversion_id)
+    except OSError:
+        logger.exception(
+            "Database job deleted but file cleanup failed for conversion %s",
+            conversion_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Conversion was deleted, but local file cleanup failed.",
+        )
 
     return {
         "deleted": True,

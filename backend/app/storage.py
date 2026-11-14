@@ -1,37 +1,34 @@
 import json
-import re
+from os import path
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 from copy import deepcopy
 from datetime import datetime, timezone
-from app.config import settings
-import shutil
 
 from app.repositories.document_job_repository import DocumentJobRepository
 
+from app.services.file_storage import (
+    create_conversion_directory,
+    delete_conversion_directory,
+    get_conversion_directory,
+    get_publications_directory,
+    get_publication_file,
+    list_publication_files,
+    write_publication_file,
+    read_json_file,
+    write_job_status,
+    validate_conversion_id,
+)
 
 LOCK = RLock()
-CONVERSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-
-
-def _validate_conversion_id(conversion_id: str) -> str:
-    if (
-        not isinstance(conversion_id, str)
-        or not CONVERSION_ID_RE.fullmatch(conversion_id)
-    ):
-        raise FileNotFoundError("Conversion not found.")
-    return conversion_id
-
 
 def create_job(organization_id: str, created_by: str):
     if not organization_id or not created_by:
         raise ValueError("Organization and creator are required.")
 
     conversion_id = uuid4().hex
-    root = settings.storage_path / conversion_id
-
-    (root / "media").mkdir(parents=True, exist_ok=True)
+    root = create_conversion_directory(conversion_id)
 
     try:
         DocumentJobRepository().create_job(
@@ -40,40 +37,24 @@ def create_job(organization_id: str, created_by: str):
             created_by=created_by,
         )
     except Exception:
-        shutil.rmtree(root, ignore_errors=True)
+        try:
+            delete_conversion_directory(conversion_id)
+        except OSError:
+            pass
         raise
 
     return conversion_id, root
 
 
 def job_dir(conversion_id: str) -> Path:
-    conversion_id = _validate_conversion_id(conversion_id)
-    path = settings.storage_path / conversion_id
-
-    if not path.is_dir():
-        raise FileNotFoundError("Conversion not found.")
-
-    return path
-
+    return get_conversion_directory(conversion_id)
 
 def write_job(conversion_id: str, data: dict):
-    conversion_id = _validate_conversion_id(conversion_id)
-    root = settings.storage_path / conversion_id
-    root.mkdir(parents=True, exist_ok=True)
-
-    temporary = root / "status.tmp"
-    destination = root / "status.json"
-
     with LOCK:
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(destination)
-
+        write_job_status(conversion_id, data)
 
 def read_job(conversion_id: str) -> dict:
-    conversion_id = _validate_conversion_id(conversion_id)
+    conversion_id = validate_conversion_id(conversion_id)
 
     data = DocumentJobRepository().get_job(conversion_id)
 
@@ -86,7 +67,7 @@ def read_job_for_organization(
     conversion_id: str,
     organization_id: str,
 ) -> dict:
-    conversion_id = _validate_conversion_id(conversion_id)
+    conversion_id = validate_conversion_id(conversion_id)
 
     if not organization_id:
         raise FileNotFoundError("Conversion not found.")
@@ -124,7 +105,7 @@ def list_jobs(
     )
 
 def update_job(conversion_id: str, **values):
-    conversion_id = _validate_conversion_id(conversion_id)
+    conversion_id = validate_conversion_id(conversion_id)
 
     return DocumentJobRepository().update_job(
         conversion_id,
@@ -135,7 +116,7 @@ def delete_job(
     conversion_id: str,
     organization_id: str,
 ) -> bool:
-    conversion_id = _validate_conversion_id(conversion_id)
+    conversion_id = validate_conversion_id(conversion_id)
 
     if not organization_id:
         raise FileNotFoundError("Conversion not found.")
@@ -372,9 +353,10 @@ def create_publication(
         if not published_questions:
             raise ValueError("No eligible questions are available for publishing.")
 
-        root = job_dir(conversion_id)
-        publications_dir = root / "publications"
-        publications_dir.mkdir(parents=True, exist_ok=True)
+        publications_dir = get_publications_directory(
+            conversion_id,
+            create=True,
+        )
 
         existing_versions = [
             int(path.stem.split("-")[1])
@@ -397,14 +379,11 @@ def create_publication(
             "questions": published_questions,
         }
 
-        destination = publications_dir / f"version-{version:04d}.json"
-        temporary = publications_dir / f"version-{version:04d}.tmp"
-
-        temporary.write_text(
-            json.dumps(publication, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        write_publication_file(
+            conversion_id,
+            version,
+            publication,
         )
-        temporary.replace(destination)
 
         return publication
 
@@ -419,16 +398,11 @@ def list_publications(
             organization_id,
         )
 
-        publications_dir = job_dir(conversion_id) / "publications"
-
-        if not publications_dir.is_dir():
-            return []
-
         publications = []
 
-        for path in publications_dir.glob("version-*.json"):
+        for path in list_publication_files(conversion_id):
             try:
-                publication = json.loads(path.read_text(encoding="utf-8"))
+                publication = read_json_file(path)
             except (OSError, json.JSONDecodeError):
                 continue
 
@@ -459,19 +433,9 @@ def read_publication(
             organization_id,
         )
 
-        if version < 1:
-            raise FileNotFoundError("Publication not found.")
+        path = get_publication_file(conversion_id, version)
 
-        path = (
-            job_dir(conversion_id)
-            / "publications"
-            / f"version-{version:04d}.json"
-        )
-
-        if not path.is_file():
-            raise FileNotFoundError("Publication not found.")
-
-        return json.loads(path.read_text(encoding="utf-8"))
+        return read_json_file(path)
 
 
 def get_analytics_overview(organization_id: str) -> dict:
