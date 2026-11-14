@@ -503,6 +503,7 @@ async def update_answer_key_decision(
         )
         saved_decision = save_answer_key_decision(
             conversion_id=conversion_id,
+            organization_id=principal.organization_id,
             entry_id=entry_id,
             decision=payload.decision,
             corrected_answer=payload.corrected_answer,
@@ -533,7 +534,10 @@ async def publish_conversion(
             conversion_id,
             principal.organization_id,
         )
-        return create_publication(conversion_id)
+        return create_publication(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -557,7 +561,10 @@ async def get_publications(
             conversion_id,
             principal.organization_id,
         )
-        publications = list_publications(conversion_id)
+        publications = list_publications(
+            conversion_id,
+            principal.organization_id,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -582,7 +589,11 @@ async def get_publication(
             conversion_id,
             principal.organization_id,
         )
-        return read_publication(conversion_id, version)
+        return read_publication(
+            conversion_id,
+            principal.organization_id,
+            version,
+        )
 
     except FileNotFoundError:
         raise HTTPException(
@@ -609,6 +620,7 @@ async def update_review_question(
         )
         saved_decision = save_review_decision(
             conversion_id=conversion_id,
+            organization_id=principal.organization_id,
             question_id=question_id,
             decision=payload.decision,
             note=payload.note.strip() if payload.note else None,

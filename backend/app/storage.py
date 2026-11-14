@@ -170,13 +170,17 @@ def update_job(conversion_id: str, **values):
 
 def save_review_decision(
     conversion_id: str,
+    organization_id: str,
     question_id: str,
     decision: str,
     note: str | None,
     reviewed_at: str,
 ):
     with LOCK:
-        data = read_job(conversion_id)
+        data = read_job_for_organization(
+            conversion_id,
+            organization_id,
+        )
 
         if data.get("status") != "completed":
             raise ValueError("Conversion is not completed.")
@@ -205,6 +209,7 @@ def save_review_decision(
 
 def save_answer_key_decision(
     conversion_id: str,
+    organization_id: str,
     entry_id: str,
     decision: str,
     corrected_answer: str | None,
@@ -212,7 +217,10 @@ def save_answer_key_decision(
     reviewed_at: str,
 ):
     with LOCK:
-        data = read_job(conversion_id)
+        data = read_job_for_organization(
+            conversion_id,
+            organization_id,
+        )
 
         if data.get("status") != "completed":
             raise ValueError("Conversion is not completed.")
@@ -261,9 +269,15 @@ def _normalize_publication_answer(answer: str, options: list[dict]) -> str | Non
     return None
 
 
-def create_publication(conversion_id: str) -> dict:
+def create_publication(
+    conversion_id: str,
+    organization_id: str,
+) -> dict:
     with LOCK:
-        data = read_job(conversion_id)
+        data = read_job_for_organization(
+            conversion_id,
+            organization_id,
+        )
 
         if data.get("status") != "completed":
             raise ValueError("Conversion is not completed.")
@@ -408,8 +422,16 @@ def create_publication(conversion_id: str) -> dict:
         return publication
 
 
-def list_publications(conversion_id: str) -> list[dict]:
+def list_publications(
+    conversion_id: str,
+    organization_id: str,
+) -> list[dict]:
     with LOCK:
+        read_job_for_organization(
+            conversion_id,
+            organization_id,
+        )
+
         publications_dir = job_dir(conversion_id) / "publications"
 
         if not publications_dir.is_dir():
@@ -439,8 +461,17 @@ def list_publications(conversion_id: str) -> list[dict]:
         )
 
 
-def read_publication(conversion_id: str, version: int) -> dict:
+def read_publication(
+    conversion_id: str,
+    organization_id: str,
+    version: int,
+) -> dict:
     with LOCK:
+        read_job_for_organization(
+            conversion_id,
+            organization_id,
+        )
+
         if version < 1:
             raise FileNotFoundError("Publication not found.")
 
@@ -590,7 +621,10 @@ def get_analytics_overview(organization_id: str) -> dict:
 
         if conversion_id:
             try:
-                publications = list_publications(conversion_id)
+                publications = list_publications(
+                    conversion_id,
+                    organization_id,
+                )
             except (FileNotFoundError, OSError):
                 publications = []
 
@@ -600,6 +634,7 @@ def get_analytics_overview(organization_id: str) -> dict:
                 try:
                     publication = read_publication(
                         conversion_id,
+                        organization_id,
                         publication_summary["version"],
                     )
                 except (FileNotFoundError, OSError, KeyError, ValueError):
