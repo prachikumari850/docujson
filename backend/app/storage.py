@@ -6,6 +6,9 @@ from uuid import uuid4
 from copy import deepcopy
 from datetime import datetime, timezone
 from app.config import settings
+import shutil
+
+from app.repositories.document_job_repository import DocumentJobRepository
 
 
 LOCK = RLock()
@@ -30,20 +33,15 @@ def create_job(organization_id: str, created_by: str):
 
     (root / "media").mkdir(parents=True, exist_ok=True)
 
-    write_job(
-        conversion_id,
-        {
-            "conversion_id": conversion_id,
-            "organization_id": organization_id,
-            "created_by": created_by,
-            "status": "queued",
-            "progress": 0,
-            "stage": "Waiting to start",
-            "error": None,
-            "result": None,
-            "review_decisions": {},
-        },
-    )
+    try:
+        DocumentJobRepository().create_job(
+            conversion_id=conversion_id,
+            organization_id=organization_id,
+            created_by=created_by,
+        )
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
 
     return conversion_id, root
 
@@ -75,24 +73,30 @@ def write_job(conversion_id: str, data: dict):
 
 
 def read_job(conversion_id: str) -> dict:
-    with LOCK:
-        path = job_dir(conversion_id) / "status.json"
+    conversion_id = _validate_conversion_id(conversion_id)
 
-        if not path.is_file():
-            raise FileNotFoundError("Conversion not found.")
+    data = DocumentJobRepository().get_job(conversion_id)
 
-        return json.loads(path.read_text(encoding="utf-8"))
+    if data is None:
+        raise FileNotFoundError("Conversion not found.")
+
+    return data
 
 def read_job_for_organization(
     conversion_id: str,
     organization_id: str,
 ) -> dict:
+    conversion_id = _validate_conversion_id(conversion_id)
+
     if not organization_id:
         raise FileNotFoundError("Conversion not found.")
 
-    data = read_job(conversion_id)
+    data = DocumentJobRepository().get_job_for_organization(
+        conversion_id,
+        organization_id,
+    )
 
-    if data.get("organization_id") != organization_id:
+    if data is None:
         raise FileNotFoundError("Conversion not found.")
 
     return data
@@ -105,68 +109,46 @@ def job_dir_for_organization(
     read_job_for_organization(conversion_id, organization_id)
     return job_dir(conversion_id)
 
-
 def list_jobs(
     limit: int = 20,
     offset: int = 0,
     organization_id: str | None = None,
 ) -> tuple[list[dict], int]:
-    storage_root = settings.storage_path
-    jobs = []
+    if not organization_id:
+        return [], 0
 
-    with LOCK:
-        for directory in storage_root.iterdir():
-            if (
-                not directory.is_dir()
-                or not CONVERSION_ID_RE.fullmatch(directory.name)
-            ):
-                continue
-
-            status_path = directory / "status.json"
-
-            if not status_path.is_file():
-                continue
-
-            try:
-                data = json.loads(
-                    status_path.read_text(encoding="utf-8")
-                )
-                modified_at = status_path.stat().st_mtime
-            except (OSError, json.JSONDecodeError):
-                continue
-
-            if not isinstance(data, dict):
-                continue
-
-            if (
-                organization_id is not None
-                and data.get("organization_id") != organization_id
-            ):
-                continue
-
-            data["_modified_at"] = modified_at
-            jobs.append(data)
-
-    jobs.sort(
-        key=lambda job: job["_modified_at"],
-        reverse=True,
+    return DocumentJobRepository().list_jobs(
+        organization_id=organization_id,
+        limit=limit,
+        offset=offset,
     )
 
-    total = len(jobs)
-    page = jobs[offset:offset + limit]
-
-    for job in page:
-        job.pop("_modified_at", None)
-
-    return page, total
-
 def update_job(conversion_id: str, **values):
-    with LOCK:
-        data = read_job(conversion_id)
-        data.update(values)
-        write_job(conversion_id, data)
-        return data
+    conversion_id = _validate_conversion_id(conversion_id)
 
+    return DocumentJobRepository().update_job(
+        conversion_id,
+        values,
+    )
+
+def delete_job(
+    conversion_id: str,
+    organization_id: str,
+) -> bool:
+    conversion_id = _validate_conversion_id(conversion_id)
+
+    if not organization_id:
+        raise FileNotFoundError("Conversion not found.")
+
+    deleted = DocumentJobRepository().delete_job(
+        conversion_id,
+        organization_id,
+    )
+
+    if not deleted:
+        raise FileNotFoundError("Conversion not found.")
+
+    return True
 
 def save_review_decision(
     conversion_id: str,
@@ -195,17 +177,20 @@ def save_review_decision(
         if not question_found:
             raise KeyError("Question not found.")
 
-        decisions = data.setdefault("review_decisions", {})
-        decisions[question_id] = {
+        review_decisions = data.get("review_decisions") or {}
+
+        review_decisions[question_id] = {
             "decision": decision,
             "note": note,
             "reviewed_at": reviewed_at,
         }
 
-        write_job(conversion_id, data)
+        updated = DocumentJobRepository().update_job(
+            conversion_id,
+            {"review_decisions": review_decisions},
+        )
 
-        return decisions[question_id]
-
+        return updated["review_decisions"][question_id]
 
 def save_answer_key_decision(
     conversion_id: str,
@@ -235,19 +220,21 @@ def save_answer_key_decision(
         if not entry_found:
             raise KeyError("Answer-key entry not found.")
 
-        decisions = data.setdefault("answer_key_decisions", {})
+        answer_key_decisions = data.get("answer_key_decisions") or {}
 
-        decisions[entry_id] = {
+        answer_key_decisions[entry_id] = {
             "decision": decision,
             "corrected_answer": corrected_answer,
             "note": note,
             "reviewed_at": reviewed_at,
         }
 
-        write_job(conversion_id, data)
+        updated = DocumentJobRepository().update_job(
+            conversion_id,
+            {"answer_key_decisions": answer_key_decisions},
+        )
 
-        return decisions[entry_id]
-
+        return updated["answer_key_decisions"][entry_id]
 
 def _normalize_publication_answer(answer: str, options: list[dict]) -> str | None:
     value = str(answer).strip().upper()

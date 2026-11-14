@@ -13,6 +13,9 @@ import fitz
 import pytest
 from app import database
 
+import mongomock
+from app.database_indexes import ensure_indexes
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -75,25 +78,37 @@ def physics_qp_doc(physics_qp_pdf):
 @pytest.fixture(autouse=True)
 def mock_mongodb_for_api_tests(request, monkeypatch):
     if request.path.name == "test_database_connection.py":
+        yield
         return
 
+    original_client = database.mongo_client
+    original_database = database.mongo_database
+
+    mongo_client = mongomock.MongoClient()
+    mongo_database = mongo_client["neetday_test"]
+
+    ensure_indexes(mongo_database)
+
     def mock_connect():
-        return None
+        database.mongo_client = mongo_client
+        database.mongo_database = mongo_database
+        return mongo_database
 
     def mock_close():
-        return None
+        database.mongo_client = None
+        database.mongo_database = None
 
-    monkeypatch.setattr(
-        database,
-        "connect_to_mongo",
-        mock_connect,
-    )
+    monkeypatch.setattr(database, "connect_to_mongo", mock_connect)
+    monkeypatch.setattr(database, "close_mongo_connection", mock_close)
 
-    monkeypatch.setattr(
-        database,
-        "close_mongo_connection",
-        mock_close,
-    )
+    mock_connect()
+
+    try:
+        yield
+    finally:
+        database.mongo_client = original_client
+        database.mongo_database = original_database
+        mongo_client.close()
 
 @pytest.fixture(autouse=True)
 def authenticate_legacy_upload_regression_tests(request, monkeypatch):

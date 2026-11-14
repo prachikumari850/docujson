@@ -48,6 +48,7 @@ from app.storage import (
     get_analytics_overview,
     read_job_for_organization,
     job_dir_for_organization,
+    delete_job
 )
 from app.services.engine import run_conversion
 from app.dependencies.security import require_csrf
@@ -798,7 +799,19 @@ async def convert(
         return read_job(conversion_id)
 
     except Exception:
-        logger.exception("Upload validation/save failed for conversion %s", conversion_id)
+        logger.exception(
+            "Upload validation/save failed for conversion %s",
+            conversion_id,
+        )
+
+        try:
+            delete_job(
+                conversion_id,
+                principal.organization_id,
+            )
+        except FileNotFoundError:
+            pass
+
         shutil.rmtree(root, ignore_errors=True)
         raise
 
@@ -1000,6 +1013,11 @@ async def delete_conversion(
 ):
     try:
         root = job_dir_for_organization(
+            conversion_id,
+            principal.organization_id,
+        )
+
+        delete_job(
             conversion_id,
             principal.organization_id,
         )
