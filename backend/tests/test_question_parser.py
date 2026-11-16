@@ -710,3 +710,89 @@ def test_roman_numbered_questions_are_parsed():
 
 def test_invalid_roman_question_label_is_not_recognized():
     assert match_question_label("IIII. Invalid question") is None
+
+def test_parenthesized_question_headings_are_parsed():
+    pages = [{
+        "page": 1,
+        "text": (
+            "SECTION A\n"
+            "(1) First question\n"
+            "(1) First option\n"
+            "(2) Second option\n"
+            "(3) Third option\n"
+            "(4) Fourth option\n"
+            "(2) Second question\n"
+            "(1) Alpha\n"
+            "(2) Beta\n"
+            "(3) Gamma\n"
+            "(4) Delta"
+        ),
+    }]
+
+    questions = [
+        q for section in parse_questions(pages)
+        for q in section["questions"]
+    ]
+
+    assert [q["question_number"] for q in questions] == [1, 2]
+    assert [q["question_label"] for q in questions] == ["1", "2"]
+    assert len(questions[0]["options"]) == 4
+    assert len(questions[1]["options"]) == 4
+    assert questions[0]["options"][0]["text"] == "First option"
+
+
+def test_parenthesized_mcq_option_labels_are_not_question_headings():
+    pages = [{
+        "page": 1,
+        "text": (
+            "SECTION A\n"
+            "1. Choose the correct answer\n"
+            "(1) First option\n"
+            "(2) Second option\n"
+            "(3) Third option\n"
+            "(4) Fourth option"
+        ),
+    }]
+
+    questions = [
+        q for section in parse_questions(pages)
+        for q in section["questions"]
+    ]
+
+    assert len(questions) == 1
+    assert questions[0]["question_number"] == 1
+    assert len(questions[0]["options"]) == 4
+
+def test_stem_above_next_question_anchor_is_not_assigned_to_previous_option():
+    lines = [
+        (100, 40, "SECTION A", fitz.Rect(40, 100, 120, 112), []),
+        (130, 40, "1. First question", fitz.Rect(40, 130, 180, 142), []),
+        (230, 60, "(1) First option", fitz.Rect(60, 230, 160, 242), []),
+        (230, 180, "(2) Second option", fitz.Rect(180, 230, 290, 242), []),
+        (230, 330, "(3) Third option", fitz.Rect(330, 230, 440, 242), []),
+        (230, 450, "(4) Fourth option", fitz.Rect(450, 230, 560, 242), []),
+        # The next question's stem is extracted just before its number.
+        (248, 60, "A ball is thrown from the top of a tower", fitz.Rect(60, 248, 300, 260), []),
+        (251, 40, "2. Second question", fitz.Rect(40, 251, 190, 263), []),
+        (280, 60, "(1) Next option", fitz.Rect(60, 280, 160, 292), []),
+    ]
+
+    sections = parse_questions([{
+        "page": 1,
+        "width": 600,
+        "height": 800,
+        "text": "",
+        "lines": lines,
+    }])
+
+    questions = {
+        q["question_number"]: q
+        for section in sections
+        for q in section["questions"]
+    }
+
+    assert "A ball is thrown" in questions[2]["original_text"]
+    assert all(
+        "A ball is thrown" not in option["text"]
+        for option in questions[1]["options"]
+    )

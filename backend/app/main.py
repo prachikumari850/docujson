@@ -978,7 +978,7 @@ async def download_zip(
 
         if media_dir.exists():
             for media_file in media_dir.iterdir():
-                if media_file.is_file():
+                if media_file.is_file() and media_file.suffix.lower() == ".svg":
                     archive.write(
                         media_file,
                         arcname=f"media/{media_file.name}",
@@ -1002,13 +1002,10 @@ async def media(
     filename: str,
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    if (
-        Path(filename).name != filename
-        or not re.fullmatch(r"[\w.-]+", filename)
-    ):
+    if Path(filename).suffix.lower() != ".svg":
         raise HTTPException(
-            status_code=400,
-            detail="Invalid filename.",
+            status_code=404,
+            detail="Media not found.",
         )
 
     try:
@@ -1031,8 +1028,10 @@ async def media(
             detail="Media not found.",
         )
 
-    return FileResponse(path)
-
+    return FileResponse(
+        path,
+        media_type="image/svg+xml",
+    )
 
 @app.delete("/api/conversions/{conversion_id}")
 async def delete_conversion(

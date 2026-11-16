@@ -290,15 +290,28 @@ def test_media_endpoint_and_unknown_conversion(client):
     conversion_id = response.json()["conversion_id"]
     media_dir = settings.storage_path / conversion_id / "media"
     media_dir.mkdir(exist_ok=True)
+
+    (media_dir / "sample.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+        encoding="utf-8",
+    )
     (media_dir / "sample.png").write_bytes(b"image data")
-    media_response = client.get(f"/api/conversions/{conversion_id}/media/sample.png")
-    assert media_response.status_code == 200
-    assert media_response.content == b"image data"
+
+    svg_response = client.get(
+        f"/api/conversions/{conversion_id}/media/sample.svg"
+    )
+    assert svg_response.status_code == 200
+    assert svg_response.headers["content-type"].startswith("image/svg+xml")
+
+    png_response = client.get(
+        f"/api/conversions/{conversion_id}/media/sample.png"
+    )
+    assert png_response.status_code == 404
+
     assert client.get("/api/conversions/missing").status_code == 404
     assert client.get("/api/conversions/missing/json").status_code == 404
     assert client.get("/api/conversions/missing/zip").status_code == 404
     assert client.get("/api/conversions/missing/media/no.png").status_code == 404
-
 
 
 def test_documents_list_returns_completed_conversion_summary(client):

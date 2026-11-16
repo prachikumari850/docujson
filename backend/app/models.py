@@ -30,6 +30,8 @@ class MathEvidence(BaseModel):
     math_unit_ids: list[str] = Field(default_factory=list)
     source_crop_filename: str | None = None
     source_crop_path: str | None = None
+    source_crop_original_filename: str | None = None
+    source_crop_svg_filename: str | None = None
     confidence: float | None = None
     review_required: bool = True
     review_reasons: list[str] = Field(default_factory=list)

@@ -66,17 +66,31 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
         assert "can be zero" in q7_options["3"]
         assert "cannot be zero" in q7_options["4"]
 
-        # Q2's graph is an embedded raster; its canonical PNG remains the
-        # directly displayable and downloadable asset beside any SVG wrapper.
-        q2_graph = next(media for media in by_number[2]["media"] if media["filename"] == "p3_img1.png")
+        # Q2's graph is raster content embedded inside a self-contained SVG.
+        q2_graph = next(
+            media for media in by_number[2]["media"]
+            if media.get("original_filename") == "p3_img1.png"
+        )
+        assert q2_graph["filename"] == "p3_img1.png.wrapper.svg"
+        assert q2_graph["original_filename"] == "p3_img1.png"
+        assert q2_graph["relative_path"] == f"media/{q2_graph['filename']}"
+        assert q2_graph["mime_type"] == "image/svg+xml"
         assert q2_graph["source_page"] == 3
         assert q2_graph["pixel_width"] > 0 and q2_graph["pixel_height"] > 0
         assert q2_graph["representation"] == "svg_wrapper"
         assert q2_graph["svg_genuine_vector"] is False
         assert "raster" in q2_graph["svg_fallback_reason"].lower()
-        graph_response = client.get(f"/api/conversions/{conversion_id}/media/{q2_graph['filename']}")
+
+        graph_response = client.get(
+            f"/api/conversions/{conversion_id}/media/{q2_graph['filename']}"
+        )
         assert graph_response.status_code == 200
-        assert graph_response.headers["content-type"].startswith("image/png")
+        assert graph_response.headers["content-type"].startswith("image/svg+xml")
+
+        png_response = client.get(
+            f"/api/conversions/{conversion_id}/media/p3_img1.png"
+        )
+        assert png_response.status_code == 404
 
         q8_options = {option["id"]: re.sub(r"\s+", "", option["text"]) for option in by_number[8]["options"]}
         assert q8_options == {
@@ -134,6 +148,46 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
             for box in [region["bbox"]]
         )
         q4_options = {option["id"]: option for option in by_number[4]["options"]}
+
+        # Math-evidence crops must be exposed as SVG while retaining
+        # their original raster source filenames.
+        option_math_crops = [
+            item
+            for question in questions
+            for option in question.get("options", [])
+            for item in option.get("math_evidence", [])
+            if item.get("source_crop_original_filename")
+        ]
+
+        # Math-evidence crops must be exposed as SVG while retaining
+        # their original raster source filenames.
+        math_crops = [
+            item
+            for question in questions
+            for item in question.get("math_evidence", [])
+        ] + [
+            item
+            for question in questions
+            for option in question.get("options", [])
+            for item in option.get("math_evidence", [])
+        ]
+
+        math_crops = [
+            item for item in math_crops
+            if item.get("source_crop_original_filename")
+        ]
+
+        assert math_crops
+
+        for item in math_crops:
+            original = item["source_crop_original_filename"]
+            svg_filename = item["source_crop_svg_filename"]
+
+            assert original.lower().endswith((".png", ".jpg", ".jpeg"))
+            assert svg_filename == f"{original}.wrapper.svg"
+            assert item["source_crop_filename"] == svg_filename
+            assert item["source_crop_path"] == f"media/{svg_filename}"
+
         assert all(len(option["math_evidence"]) == 2 for option in q4_options.values() if option["text"].strip())
         assert all(option["source"]["content_bboxes"] for option in q4_options.values())
         compact_q4_option1 = re.sub(r"\s+", "", q4_options["1"]["text"])
@@ -281,6 +335,37 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
             ]
             all_media = [media for question in questions for media in question["media"]]
             all_media.extend(media for option in options for media in option["media"])
+            # Public media references must be SVG-only.
+            assert all(
+                media["filename"].lower().endswith(".svg")
+                and media["relative_path"].lower().endswith(".svg")
+                and media["mime_type"] == "image/svg+xml"
+                for media in all_media
+            )
+
+            # Math-evidence source crops must also expose SVG paths.
+            for question in questions:
+                evidence_scopes = [
+                    question.get("math_evidence", []),
+                    *[
+                        option.get("math_evidence", [])
+                        for option in question.get("options", [])
+                    ],
+                ]
+
+                for evidence_items in evidence_scopes:
+                    for item in evidence_items:
+                        if item.get("source_crop_filename"):
+                            assert item["source_crop_filename"].lower().endswith(".svg")
+                            assert item["source_crop_path"].lower().endswith(".svg")
+
+            # The ZIP must not contain publicly packaged raster media.
+            media_entries = [
+                name for name in archive_names
+                if name.startswith("media/") and name != "media/manifest.json"
+            ]
+            assert media_entries
+            assert all(name.lower().endswith(".svg") for name in media_entries)
             wrappers = [media for media in all_media if media.get("svg_filename")]
             assert wrappers
             assert all(
@@ -322,8 +407,22 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
                     assert svg_root.find(".//{http://www.w3.org/2000/svg}image") is None
                 else:
                     assert svg_root.find(".//{http://www.w3.org/2000/svg}image") is not None
+                    image_element = svg_root.find(
+                        ".//{http://www.w3.org/2000/svg}image"
+                    )
+                    assert image_element is not None
+                    assert any(
+                        value.startswith("data:image/") and ";base64," in value
+                        for value in image_element.attrib.values()
+                    )
             assert "debug/extraction_debug.json" in archive_names
             manifest = json.loads(archive.read("media/manifest.json"))
+            assert all(
+                asset["filename"].lower().endswith(".svg")
+                and asset["relative_path"].lower().endswith(".svg")
+                and asset["mime_type"] == "image/svg+xml"
+                for asset in manifest["assets"]
+            )
             assert all(f"media/{asset['filename']}" in archive_names for asset in manifest["assets"])
             extraction_debug = json.loads(archive.read("debug/extraction_debug.json"))
             page3_debug = next(page for page in extraction_debug if page["page"] == 3)

@@ -6,7 +6,7 @@ vector reconstruction. The original raster crop remains alongside either
 representation as a visual fallback.
 """
 from __future__ import annotations
-
+import base64
 import html
 import logging
 import math
@@ -264,7 +264,8 @@ def create_raster_svg_wrapper(source_path: Path, svg_path: Path) -> dict[str, in
     mime_type = SUPPORTED_RASTER_FORMATS.get(image_format)
     if mime_type is None or width <= 0 or height <= 0:
         raise ValueError("Source asset is not a readable PNG or JPEG image")
-    href = html.escape(source_path.name, quote=True)
+    image_data = base64.b64encode(source_path.read_bytes()).decode("ascii")
+    href = f"data:{mime_type};base64,{image_data}"
     svg = (
         f'<svg xmlns="{SVG_NS}" xmlns:xlink="http://www.w3.org/1999/xlink" '
         f'width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
@@ -319,4 +320,52 @@ def attach_raster_svg_wrappers(sections: list[dict], media_dir: Path) -> list[st
                         "An SVG wrapper is provided for browser compatibility, but the original source is raster and has not been vectorized.",
                     )
                     wrapped.append(filename)
+
+    # Generate self-contained SVG wrappers for math-evidence crops.
+    math_wrapped: dict[str, str] = {}
+
+    for section in sections:
+        for question in section.get("questions", []):
+            evidence_scopes = [question.get("math_evidence", [])]
+            evidence_scopes.extend(
+                option.get("math_evidence", [])
+                for option in question.get("options", [])
+            )
+
+            for evidence_items in evidence_scopes:
+                for evidence in evidence_items:
+                    filename = evidence.get("source_crop_filename")
+                    if not filename:
+                        continue
+
+                    if filename in math_wrapped:
+                        svg_filename = math_wrapped[filename]
+                    else:
+                        source = media_dir / filename
+
+                        if source.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                            continue
+
+                        destination = source.with_name(
+                            f"{source.name}.wrapper.svg"
+                        )
+
+                        try:
+                            metadata = create_raster_svg_wrapper(
+                                source,
+                                destination,
+                            )
+                        except (OSError, ValueError, ET.ParseError):
+                            logger.exception(
+                                "Could not create SVG wrapper for math evidence %s",
+                                filename,
+                            )
+                            continue
+
+                        svg_filename = metadata["filename"]
+                        math_wrapped[filename] = svg_filename
+                        wrapped.append(filename)
+
+                    evidence["source_crop_original_filename"] = filename
+                    evidence["source_crop_svg_filename"] = svg_filename
     return wrapped

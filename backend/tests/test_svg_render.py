@@ -1,12 +1,12 @@
 import xml.etree.ElementTree as ET
 import fitz
-
+import base64
 from PIL import Image
 
 from app.services.svg_render import attach_raster_svg_wrappers, create_raster_svg_wrapper, reconstruct_pdf_vector_svg
 
 
-def test_png_wrapper_is_valid_references_original_and_preserves_aspect_ratio(tmp_path):
+def test_png_wrapper_is_self_contained_and_preserves_aspect_ratio(tmp_path):
     source = tmp_path / "diagram.png"
     wrapper = tmp_path / "diagram.png.wrapper.svg"
     Image.new("RGB", (320, 180), "white").save(source)
@@ -18,7 +18,11 @@ def test_png_wrapper_is_valid_references_original_and_preserves_aspect_ratio(tmp
     assert root.attrib["viewBox"] == "0 0 320 180"
     image = root.find("{http://www.w3.org/2000/svg}image")
     assert image is not None
-    assert image.attrib["href"] == source.name
+    href = image.attrib["href"]
+    assert href.startswith("data:image/png;base64,")
+
+    embedded_data = href.split(",", 1)[1]
+    assert base64.b64decode(embedded_data) == source.read_bytes()
     assert image.attrib["preserveAspectRatio"] == "xMidYMid meet"
     assert metadata["representation"] == "svg_wrapper"
     assert metadata["width_px"] / metadata["height_px"] == 320 / 180

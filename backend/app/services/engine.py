@@ -70,6 +70,33 @@ def match_question_label(text: str):
 
     return None
 
+PARENTHESIZED_QUESTION_RE = re.compile(
+    r"^\s*\((\d{1,3})\)\s+(.+)$"
+)
+
+FIRST_OPTION_RE = re.compile(
+    r"^\s*\(1\)\s*\S+"
+)
+
+
+def match_parenthesized_question(text: str, next_text: str, expected_number: int):
+    """Recognize parenthesized question headings using the following option marker."""
+    text = text.replace("\u00a0", " ").strip()
+    next_text = next_text.replace("\u00a0", " ").strip()
+
+    match = PARENTHESIZED_QUESTION_RE.match(text)
+    if not match:
+        return None
+
+    number = int(match.group(1))
+    if number != expected_number:
+        return None
+
+    if not FIRST_OPTION_RE.match(next_text):
+        return None
+
+    return number, match.group(1), match.group(2).strip()
+
 OPTION_RE = re.compile(r"(?:\((\d{1,3})\)|\[(\d{1,3})\]|\(([A-Ha-h])\)|\[([A-Ha-h])\]|([A-Da-d])[).:])\s*")
 
 ANSWER_RE = re.compile(
@@ -1900,20 +1927,37 @@ def parse_questions(pages: list[dict]):
             page_lines = [(line, None) for line in page["text"].splitlines()]
         positioned_anchors = []
         page_option_anchors = []
+
         for anchor_line, anchor_bbox in page_lines:
             anchor_match = match_question_label(anchor_line)
 
             if anchor_match and anchor_bbox is not None:
                 anchor_number, _, _ = anchor_match
+
                 positioned_anchors.append((
                     anchor_number,
                     line_order_y.get(id(anchor_bbox), anchor_bbox.y0),
                     (anchor_bbox.x0 + anchor_bbox.x1) / 2,
                 ))
+
             if anchor_bbox is not None:
-                for parsed_option in numbered_options(anchor_line.replace("\u00a0", " ").strip()):
-                    option_x = anchor_bbox.x0 + (parsed_option["offset"] / max(1, len(anchor_line))) * anchor_bbox.width
-                    page_option_anchors.append((parsed_option["id"], option_x, line_baseline_y.get(id(anchor_bbox), anchor_bbox.y0)))
+                for parsed_option in numbered_options(
+                    anchor_line.replace("\u00a0", " ").strip()
+                ):
+                    option_x = (
+                        anchor_bbox.x0
+                        + (parsed_option["offset"] / max(1, len(anchor_line)))
+                        * anchor_bbox.width
+                    )
+
+                    page_option_anchors.append((
+                        parsed_option["id"],
+                        option_x,
+                        line_baseline_y.get(
+                            id(anchor_bbox),
+                            anchor_bbox.y0,
+                        ),
+                    ))
         pending_option_math = {}
         pending_option_prefix = {}
         page_heading = next(
@@ -1927,8 +1971,16 @@ def parse_questions(pages: list[dict]):
                 current_section = {"section_name": page_section_name, "questions": []}
             started_questions = True
 
-        for line, line_bbox in page_lines:
+        for line_index, (line, line_bbox) in enumerate(page_lines):
             text = line.replace("\u00a0", " ").strip()
+            next_text = next(
+                (
+                    candidate.replace("\u00a0", " ").strip()
+                    for candidate, _ in page_lines[line_index + 1:]
+                    if candidate.strip()
+                ),
+                "",
+            )
             source_line_y = line_order_y.get(id(line_bbox), line_bbox.y0 if line_bbox is not None else 0)
 
             if not text:
@@ -1950,7 +2002,10 @@ def parse_questions(pages: list[dict]):
                 started_questions = True
                 continue
 
-            question_match = match_question_label(text)
+            question_match = (
+                match_question_label(text)
+                or match_parenthesized_question(text, next_text, expected_number)
+            )
 
             if question_match:
                 if not started_questions:
@@ -2098,14 +2153,28 @@ def parse_questions(pages: list[dict]):
                     formula_fragment
                     and any(line_bbox.y0 < anchor_y < line_bbox.y1 for _, anchor_y, _ in upcoming)
                 )
+
+                current_option_anchor_distances = [
+                    abs(line_baseline - anchor_y)
+                    for option_id, (anchor_x, anchor_y) in
+                    question.get("_option_anchors", {}).items()
+                    if question.get("_option_anchor_pages", {}).get(option_id) == page_number
+                    and (anchor_x >= page.get("width", 0) / 2)
+                    == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
+                ]
+
+                upcoming_question_distances = [
+                    abs(line_baseline - anchor_y)
+                    for _, anchor_y, _ in upcoming
+                ]
+
                 owned_by_current_option = bool(
-                    question.get("_option_started")
-                    and any(
-                        question.get("_option_anchor_pages", {}).get(option_id) == page_number
-                        and abs(line_baseline - anchor_y) <= 22
-                        and (anchor_x >= page.get("width", 0) / 2)
-                        == ((line_bbox.x0 + line_bbox.x1) / 2 >= page.get("width", 0) / 2)
-                        for option_id, (anchor_x, anchor_y) in question.get("_option_anchors", {}).items()
+                    current_option_anchor_distances
+                    and min(current_option_anchor_distances) <= 22
+                    and (
+                        not upcoming_question_distances
+                        or min(current_option_anchor_distances)
+                        <= min(upcoming_question_distances)
                     )
                 )
                 option_grid_continuation = bool(
@@ -3788,6 +3857,16 @@ def run_conversion(
                             "option_id": None,
                             "association_scope": "math_question_evidence",
                         })
+                        if evidence.get("source_crop_svg_filename"):
+                            referenced_by_file.setdefault(
+                                evidence["source_crop_svg_filename"],
+                                {
+                                    "question_id": parsed_question["question_id"],
+                                    "question_number": parsed_question["question_number"],
+                                    "option_id": None,
+                                    "association_scope": "math_question_evidence",
+                                },
+                            )
                 for option in parsed_question.get("options", []):
                     for evidence in option.get("math_evidence", []):
                         if evidence.get("source_crop_filename"):
@@ -3797,6 +3876,17 @@ def run_conversion(
                                 "option_id": option["id"],
                                 "association_scope": "math_option_evidence",
                             })
+
+                            if evidence.get("source_crop_svg_filename"):
+                                referenced_by_file.setdefault(
+                                    evidence["source_crop_svg_filename"],
+                                    {
+                                        "question_id": parsed_question["question_id"],
+                                        "question_number": parsed_question["question_number"],
+                                        "option_id": option["id"],
+                                        "association_scope": "math_option_evidence",
+                                    },
+                                )
         asset_by_filename = {asset["filename"]: asset for asset in document_data.get("media", [])}
         referenced_assets_by_filename = {
             asset["filename"]: asset
@@ -3815,7 +3905,9 @@ def run_conversion(
                             referenced_assets_by_filename[filename] = {
                                 "asset_id": f"math-evidence-{hashlib.sha1(filename.encode()).hexdigest()[:12]}",
                                 "filename": filename,
+                                "svg_filename": evidence.get("source_crop_svg_filename"),
                                 "type": "math_evidence_source",
+                                "representation": "svg_wrapper" if evidence.get("source_crop_svg_filename") else "raster",
                                 "source_page": evidence.get("source_page"),
                                 "bbox": evidence.get("source_bbox"),
                             }
@@ -3828,6 +3920,9 @@ def run_conversion(
         media_dir = root / "media"
         for media_file in sorted(media_dir.iterdir() if media_dir.exists() else []):
             if not media_file.is_file():
+                continue
+
+            if media_file.suffix.lower() != ".svg":
                 continue
             original_name = svg_sources.get(media_file.name)
             source_metadata = referenced_assets_by_filename.get(original_name or "", {})
@@ -3888,6 +3983,47 @@ def run_conversion(
             "unassociated_assets": [asset["filename"] for asset in manifest_assets if not asset["associated_question_id"]],
         }
         (root / "media_manifest.json").write_text(json.dumps(media_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Expose SVG files only in the public API result.
+        for section in result["sections"]:
+            for question in section["questions"]:
+                scopes = [question, *question.get("options", [])]
+
+                for scope in scopes:
+                    for asset in scope.get("media", []):
+                        svg_filename = asset.get("svg_filename")
+
+                        if not svg_filename:
+                            raise ValueError(
+                                f"SVG output missing for media asset: {asset.get('filename')}"
+                            )
+
+                        asset["original_filename"] = asset.get(
+                            "original_filename",
+                            asset["filename"],
+                        )
+                        asset["filename"] = svg_filename
+                        asset["relative_path"] = f"media/{svg_filename}"
+                        asset["mime_type"] = "image/svg+xml"
+                        asset["svg_relative_path"] = f"media/{svg_filename}"
+                        asset["svg_mime_type"] = "image/svg+xml"
+
+                    for evidence in scope.get("math_evidence", []):
+                        svg_filename = evidence.get("source_crop_svg_filename")
+
+                        if evidence.get("source_crop_filename"):
+                            if not svg_filename:
+                                raise ValueError(
+                                    "SVG output missing for math-evidence crop: "
+                                    f"{evidence['source_crop_filename']}"
+                                )
+
+                            evidence["source_crop_original_filename"] = (
+                                evidence.get("source_crop_original_filename")
+                                or evidence["source_crop_filename"]
+                            )
+                            evidence["source_crop_filename"] = svg_filename
+                            evidence["source_crop_path"] = f"media/{svg_filename}"
 
         result_path = root / "result.json"
 
