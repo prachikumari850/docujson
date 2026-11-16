@@ -369,3 +369,4 @@ def attach_raster_svg_wrappers(sections: list[dict], media_dir: Path) -> list[st
                     evidence["source_crop_original_filename"] = filename
                     evidence["source_crop_svg_filename"] = svg_filename
     return wrapped
+

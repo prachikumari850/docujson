@@ -2,7 +2,11 @@ import { useMemo, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import MediaPreview from "./MediaPreview";
 import MathEvidencePreview from "./MathEvidencePreview";
-import { splitMediaForPreview } from "../utils/mediaPresentation";
+import {
+    splitMediaForPreview,
+    buildQuestionContentLayout,
+    pairQuestionMediaWithOptions,
+} from "../utils/mediaPresentation";
 import { getValidatedMathOnlyOption, splitInlineVectorNotation } from "../utils/inlineMath";
 import { renderValidatedLatex } from "../utils/mathRenderer";
 
@@ -43,6 +47,169 @@ function QuestionText({ text }) {
         </>
     );
 }
+
+
+function needsSpaceBetween(previous, current) {
+    const left = String(previous?.text ?? "").trim();
+    const right = String(current?.text ?? "").trim();
+
+    if (!left || !right) return false;
+
+    if (/^[,.;:!?%)\]}।]/u.test(right)) return false;
+    if (/[(\[{]$/u.test(left)) return false;
+
+    return true;
+}
+
+
+function SegmentText({ item, mathEvidence = [] }) {
+    const segments = item.sources?.length
+        ? item.sources
+        : item.source
+            ? [item.source]
+            : [];
+
+    if (!segments.length) return null;
+
+    return (
+        <span className="whitespace-pre-wrap text-base text-navy">
+            {segments.map((segment, index) => {
+                const previous = segments[index - 1];
+                const lang = getSegmentLanguage(segment);
+
+                return (
+                    <span key={`${lang}-${index}`}>
+                        {index > 0 && needsSpaceBetween(previous, segment) && " "}
+                        {segment.kind === "math" &&
+                            segment.status === "confirmed" &&
+                            segment.review_reasons?.length === 0 &&
+                            typeof segment.latex === "string" ? (
+                            (() => {
+                                const rendered = renderValidatedLatex(
+                                    segment.latex,
+                                    { reviewRequired: false }
+                                );
+
+                                return rendered.status === "rendered" ? (
+                                    <span
+                                        lang={lang}
+                                        className="inline-block align-baseline"
+                                        dangerouslySetInnerHTML={{
+                                            __html: rendered.html,
+                                        }}
+                                    />
+                                ) : (
+                                    segment.text
+                                );
+                            })()
+                        ) : (
+                            <span lang={lang}>
+                                {splitInlineVectorNotation(segment.text).map(
+                                    (part, partIndex) => {
+                                        if (part.type === "text") {
+                                            return (
+                                                <span key={partIndex}>
+                                                    {part.value}
+                                                </span>
+                                            );
+                                        }
+
+                                        const rendered = renderValidatedLatex(
+                                            part.latex,
+                                            { reviewRequired: false }
+                                        );
+
+                                        return rendered.status === "rendered" ? (
+                                            <span
+                                                key={partIndex}
+                                                className="align-baseline"
+                                                dangerouslySetInnerHTML={{
+                                                    __html: rendered.html,
+                                                }}
+                                            />
+                                        ) : (
+                                            <span key={partIndex}>
+                                                {part.source}
+                                            </span>
+                                        );
+                                    }
+                                )}
+                            </span>
+                        )}
+                    </span>
+                );
+            })}
+        </span>
+    );
+}
+
+
+function getSegmentLanguage(segment) {
+    if (segment.language || segment.lang) {
+        return segment.language || segment.lang;
+    }
+
+    // Detect Devanagari text rather than assuming a particular column language.
+    return /[\u0900-\u097F]/.test(segment.text ?? "") ? "hi" : "en";
+}
+
+function QuestionContent({ question, conversionId, pairedMedia }) {
+    const contentQuestion = pairedMedia
+        ? { ...question, media: [pairedMedia.mainMedia] }
+        : question;
+
+    const layout = buildQuestionContentLayout(contentQuestion);
+
+    if (!layout) {
+        return (
+            <>
+                <QuestionText text={question.question} />
+                <MediaPreview
+                    media={pairedMedia ? [pairedMedia.mainMedia] : question.media}
+                    conversionId={conversionId}
+                    inline
+                />
+            </>
+        );
+    }
+
+    const renderColumn = (items) =>
+        items.map((item, index) => (
+            <div key={`${item.type}-${item.page}-${index}`} className="min-w-0">
+                {item.type === "text" ? (
+                    <SegmentText
+                        item={item}
+                        mathEvidence={question.math_evidence}
+                    />
+                ) : (
+                    <MediaPreview
+                        media={[item.media]}
+                        conversionId={conversionId}
+                        inline
+                    />
+                )}
+            </div>
+        ));
+
+    return (
+        <div className="mt-2 grid grid-cols-1 gap-x-5 gap-y-3 sm:grid-cols-2">
+            <div className="min-w-0 space-y-2">
+                {renderColumn(layout.left)}
+            </div>
+
+            <div className="min-w-0 space-y-2">
+                {renderColumn(layout.right)}
+            </div>
+
+            {layout.full.length > 0 && (
+                <div className="col-span-full min-w-0 space-y-2">
+                    {renderColumn(layout.full)}
+                </div>
+            )}
+        </div>
+    );
+}
+
 
 function OptionList({ options, correctAnswer, conversionId }) {
     if (!options?.length) return null;
@@ -91,7 +258,13 @@ function OptionList({ options, correctAnswer, conversionId }) {
                                     <strong>Unverified local vision candidate:</strong> {option.vision_verification.candidate_transcription}
                                 </span>
                             )}
-                            {media.content.length > 0 && <MediaPreview media={media.content} conversionId={conversionId} />}
+                            {media.content.length > 0 && (
+                                <MediaPreview
+                                    media={media.content}
+                                    conversionId={conversionId}
+                                    inline
+                                />
+                            )}
                             {media.evidence.length > 0 && (
                                 <details className="mt-3 rounded-lg border border-lavender/70 bg-lavender-light/30 p-2 text-xs text-navy/80">
                                     <summary className="cursor-pointer font-semibold">Source crops and media evidence ({media.evidence.length})</summary>
@@ -106,48 +279,107 @@ function OptionList({ options, correctAnswer, conversionId }) {
     );
 }
 
+
 function QuestionCard({ question, conversionId }) {
-    const hasAnswer = question.correct_answer !== null && question.correct_answer !== undefined;
+    const hasAnswer =
+        question.correct_answer !== null &&
+        question.correct_answer !== undefined;
+
+    const pairedMedia = pairQuestionMediaWithOptions(question);
 
     return (
         <article className="rounded-2xl border border-lavender bg-white p-5 shadow-sm">
             <div className="mb-3 flex flex-wrap items-center gap-2">
-                <Badge tone="bg-pink-light text-brand-pink">Q{question.question_number ?? "?"}</Badge>
-                {question.question_type && <Badge>{question.question_type}</Badge>}
-                {question.marks !== null && question.marks !== undefined && <Badge tone="bg-sky-soft text-sky-700">{question.marks} marks</Badge>}
-                {question.source?.page && <Badge tone="bg-orange-100 text-orange-700">Page {question.source.page}</Badge>}
+                <Badge tone="bg-pink-light text-brand-pink">
+                    Q{question.question_number ?? "?"}
+                </Badge>
+
+                {question.question_type && (
+                    <Badge>{question.question_type}</Badge>
+                )}
+
+                {question.marks !== null && question.marks !== undefined && (
+                    <Badge tone="bg-sky-soft text-sky-700">
+                        {question.marks} marks
+                    </Badge>
+                )}
+
+                {question.source?.page && (
+                    <Badge tone="bg-orange-100 text-orange-700">
+                        Page {question.source.page}
+                    </Badge>
+                )}
+
                 {question.review_required && (
                     <Badge tone="bg-amber-100 text-amber-700">
                         <span className="inline-flex items-center gap-1">
-                            <TriangleAlert size={12} /> Needs review
+                            <TriangleAlert size={12} />
+                            Needs review
                         </span>
                     </Badge>
                 )}
             </div>
-            <QuestionText text={question.question} />
-            <MathEvidencePreview evidence={question.math_evidence} conversionId={conversionId} inline={!question.question?.en?.trim() && !question.question?.hi?.trim()} />
-            <OptionList options={question.options} correctAnswer={question.correct_answer} conversionId={conversionId} />
-            {question.review_required && question.review_reasons?.length > 0 && (
-                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                    <p className="font-semibold">Review needed</p>
-                    <ul className="mt-1 list-inside list-disc">
-                        {question.review_reasons.map((reason, index) => <li key={`${index}-${reason}`}>{reason}</li>)}
-                    </ul>
-                </div>
-            )}
+
+            <QuestionContent
+                question={question}
+                conversionId={conversionId}
+                pairedMedia={pairedMedia}
+            />
+
+            <MathEvidencePreview
+                evidence={question.math_evidence}
+                conversionId={conversionId}
+                inline={
+                    !question.question?.en?.trim() &&
+                    !question.question?.hi?.trim()
+                }
+            />
+
+            <OptionList
+                options={pairedMedia?.options ?? question.options}
+                correctAnswer={question.correct_answer}
+                conversionId={conversionId}
+            />
+
+            {question.review_required &&
+                question.review_reasons?.length > 0 && (
+                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                        <p className="font-semibold">Review needed</p>
+                        <ul className="mt-1 list-inside list-disc">
+                            {question.review_reasons.map((reason, index) => (
+                                <li key={`${index}-${reason}`}>{reason}</li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+
             <p className="mt-3 text-sm text-navy/70">
                 {hasAnswer ? (
                     <>
-                        <span className="font-semibold text-navy">Answer:</span> {String(question.correct_answer)}
+                        <span className="font-semibold text-navy">
+                            Answer:
+                        </span>{" "}
+                        {String(question.correct_answer)}
                     </>
                 ) : (
                     "Answer not found in the document."
                 )}
             </p>
-            <MediaPreview media={question.media} conversionId={conversionId} />
+
+            {!buildQuestionContentLayout(
+                pairedMedia
+                    ? { ...question, media: [pairedMedia.mainMedia] }
+                    : question
+            ) && (
+                    <MediaPreview
+                        media={[]}
+                        conversionId={conversionId}
+                    />
+                )}
         </article>
     );
 }
+
 
 function QuestionList({ items, conversionId }) {
     const [visible, setVisible] = useState(PAGE_SIZE);
