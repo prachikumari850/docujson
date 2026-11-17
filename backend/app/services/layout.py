@@ -303,22 +303,18 @@ def _cluster_columns(lines, page_width: float) -> list[dict]:
         if line["width"] >= page_width * 0.68:
             continue
 
-        best_column = None
-        best_distance = float("inf")
+        line_center = (line["x0"] + line["x1"]) / 2
 
-        for column in columns:
-            x0, _, x1, _ = column["bbox"]
+        best_column = min(
+            columns,
+            key=lambda column: abs(
+                line["x0"] - column["bbox"][0]
+            ),
+        )
 
-            if line["x1"] <= x0:
-                distance = x0 - line["x1"]
-            elif line["x0"] >= x1:
-                distance = line["x0"] - x1
-            else:
-                distance = 0.0
-
-            if distance < best_distance:
-                best_distance = distance
-                best_column = column
+        best_distance = abs(
+            line["x0"] - best_column["bbox"][0]
+        )
 
         if best_column is not None and best_distance <= max(
             32.0,
@@ -439,31 +435,28 @@ def _build_regions(lines, columns, page_width: float, page_height: float):
         for column in columns
     }
 
+    line_to_column = {
+        line_index: column["column_index"]
+        for column in columns
+        for line_index in column.get("line_indices", [])
+    }
+
     for line in lines:
         if line["index"] in spanning_indices:
             continue
 
-        best_column = min(
-            columns,
-            key=lambda column: (
-                max(
-                    column["bbox"][0] - line["center_x"],
-                    0.0,
-                    line["center_x"] - column["bbox"][2],
-                ),
-                abs(
-                    line["center_x"]
-                    - (
-                        column["bbox"][0]
-                        + column["bbox"][2]
-                    ) / 2
-                ),
-            ),
-        )
+        column_index = line_to_column.get(line["index"])
 
-        column_assignments[
-            best_column["column_index"]
-        ].append(line)
+        if column_index is None:
+            best_column = min(
+                columns,
+                key=lambda column: abs(
+                    line["x0"] - column["bbox"][0]
+                ),
+            )
+            column_index = best_column["column_index"]
+
+        column_assignments[column_index].append(line)
 
     band_count = len(separators) + 1
 

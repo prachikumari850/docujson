@@ -1,3 +1,6 @@
+import httpx
+
+from app.services.vision import verify_math_image
 import json
 import hashlib
 import logging
@@ -26,7 +29,94 @@ from app.services.math_pipeline import attach_math_evidence, page_math_segments,
 from app.services.groq_vision import verify_pages_with_groq
 from app.services.layout import detect_page_layout
 
+
 logger = logging.getLogger("docujson")
+
+
+def verify_suspicious_option_crops(sections: list[dict], media_dir: Path) -> dict:
+    summary = {
+        "enabled": bool(settings.ollama_enabled),
+        "available": False,
+        "model": settings.ollama_model if settings.ollama_enabled else None,
+        "used": False,
+        "regions_attempted": 0,
+        "regions_completed": 0,
+        "warnings": [],
+    }
+
+    if not settings.ollama_enabled:
+        return summary
+
+    base_url = settings.ollama_base_url.rstrip("/")
+
+    try:
+        response = httpx.get(
+            f"{base_url}/api/tags",
+            timeout=settings.ollama_timeout_seconds,
+        )
+        response.raise_for_status()
+        models = response.json().get("models", [])
+
+        available_models = {
+            model.get("name")
+            for model in models
+            if isinstance(model, dict)
+        }
+
+        if settings.ollama_model not in available_models:
+            summary["warnings"].append(
+                f"Ollama model '{settings.ollama_model}' is not available."
+            )
+            return summary
+
+        summary["available"] = True
+
+    except Exception as exc:
+        summary["warnings"].append(
+            f"Ollama availability check failed: {type(exc).__name__}: {exc}"
+        )
+        return summary
+
+    for section in sections:
+        for question in section.get("questions", []):
+            for option in question.get("options", []):
+                for asset in option.get("media", []):
+                    if asset.get("type") != "option_crop":
+                        continue
+
+                    filename = asset.get("filename")
+                    if not filename:
+                        continue
+
+                    image_path = media_dir / filename
+                    if not image_path.is_file():
+                        summary["warnings"].append(
+                            f"Ollama verification image not found: {filename}"
+                        )
+                        continue
+
+                    summary["regions_attempted"] += 1
+
+                    try:
+                        candidate = verify_math_image(
+                            image_path,
+                            base_url=base_url,
+                            model=settings.ollama_model,
+                            timeout_seconds=settings.ollama_timeout_seconds,
+                        )
+
+                        option["vision_candidate"] = candidate
+                        summary["regions_completed"] += 1
+                        summary["used"] = True
+
+                    except Exception as exc:
+                        summary["warnings"].append(
+                            f"Ollama verification failed for {filename}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+    return summary
+
 
 ROMAN_NUMERAL_RE = re.compile(
     r"^(?=.)M{0,3}(CM|CD|D?C{0,3})"
@@ -3480,6 +3570,11 @@ def run_conversion(
                 page_numbers=groq_review_pages,
             )
 
+            ollama_verification = verify_suspicious_option_crops(
+                sections,
+                root / "media",
+            )
+
             if segmentation_issues:
                 extraction_issue_summary = Counter(issue["code"] for issue in segmentation_issues)
                 math_extraction["segmentation_issues"] = segmentation_issues
@@ -3774,6 +3869,7 @@ def run_conversion(
         extraction_warnings = list(answer_parse["warnings"])
         extraction_warnings.extend(math_extraction["warnings"])
         extraction_warnings.extend(groq_verification["warnings"])
+        extraction_warnings.extend(ollama_verification["warnings"])
         for page in document_data["pages"]:
             extraction_warnings.extend(page.get("ocr_warnings", []))
         if missing_answers:
@@ -3811,6 +3907,7 @@ def run_conversion(
                     "segmentation_issues": math_extraction.get("segmentation_issues", []),
                 },
                 "groq_verification": groq_verification,
+                "ollama_verification": ollama_verification,
                 "extraction_summary": {
                     "confirmed_mcq": classification["confirmed_mcq"],
                     "unresolved": classification["unresolved"],
@@ -3827,6 +3924,16 @@ def run_conversion(
                 for page in document_data["pages"]
             ) else []),
         }
+
+        wrapped_assets = attach_raster_svg_wrappers(
+            result["sections"],
+            root / "media",
+        )
+
+        logger.info(
+            "Generated SVG raster wrappers for %d media assets",
+            len(wrapped_assets),
+        )
 
         # Portable ZIP-relative media paths are part of the same validated API
         # result. Keep the endpoint filename fields for existing browser URLs.

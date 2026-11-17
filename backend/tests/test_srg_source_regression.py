@@ -131,6 +131,9 @@ def test_supplied_srg_paper_and_key_regression(tmp_path, monkeypatch):
         assert sum(math_summary["unassigned_reasons"].values()) == math_summary["unassigned"]
         assert all(fragment["reason"] and fragment["atom_ids"] for fragment in math_summary["unassigned_fragments"])
         assert option_3_2["math_evidence"]
+        print("\nOPTION SOURCE:", option_3_2["source"])
+        print("\nMATH EVIDENCE:", option_3_2["math_evidence"])
+        print("\nALTERNATE CONTENT:", option_3_2["source"].get("alternate_content_bboxes", []))
         assert len(option_3_2["math_evidence"]) == 2
         assert len({tuple(item["source_bbox"]) for item in option_3_2["math_evidence"]}) == 2
         assert all(item["source_page"] == option_3_2["source"]["page"] for item in option_3_2["math_evidence"])

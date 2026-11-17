@@ -117,7 +117,13 @@ def _coverage(token_box: fitz.Rect, regions: list[fitz.Rect]) -> float:
     return min(1.0, covered / token_box.get_area())
 
 
-def _ownership_decision(token_box: fitz.Rect, page_number: int, sections: list[dict]):
+def _ownership_decision(
+    token_box: fitz.Rect,
+    page_number: int,
+    sections: list[dict],
+    *,
+    option_threshold: float = 0.5,
+):
     options: list[tuple[float, dict, dict]] = []
     questions: list[tuple[float, dict]] = []
     for section in sections:
@@ -141,7 +147,7 @@ def _ownership_decision(token_box: fitz.Rect, page_number: int, sections: list[d
         {"question_id": question.get("question_id"), "coverage": round(score, 4)}
         for score, question in questions[:4]
     ]
-    if options and options[0][0] >= 0.5:
+    if options and options[0][0] >= option_threshold:
         best = options[0]
         competing = [item for item in options[1:] if item[0] >= best[0] - 0.05]
         if not competing:
@@ -254,7 +260,12 @@ def attach_math_evidence(sections: list[dict], pages: list[dict], source_documen
                     })
                     continue
                 token_box = fitz.Rect(values)
-                owner, reason, option_candidates, question_candidates = _ownership_decision(token_box, page_number, sections)
+                owner, reason, option_candidates, question_candidates = _ownership_decision(
+                    token_box,
+                    page_number,
+                    sections,
+                    option_threshold=0.25,
+                )
                 row_context = {"column": row.get("column"), "baseline": row.get("baseline")}
                 atom_conflicts = [atom_id for atom_id in atom_ids if atom_id in assigned_atom_owners]
                 if owner is not None and atom_conflicts:
