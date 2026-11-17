@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5vl:3b"
     ollama_timeout_seconds: float = Field(default=90.0, gt=0)
 
+    # Optional Groq visual verification
+    groq_enabled: bool = False
+    groq_api_key: str | None = None
+    groq_model: str = "qwen/qwen3.8-27b"
+    groq_timeout_seconds: float = Field(default=120.0, gt=0)
+
     tesseract_cmd: str | None = None
     tessdata_prefix: str | None = None
     ocr_languages: str = Field(

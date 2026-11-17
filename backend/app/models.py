@@ -29,7 +29,7 @@ class MathEvidence(BaseModel):
     atom_ids: list[str] = Field(default_factory=list)
     math_unit_ids: list[str] = Field(default_factory=list)
     source_crop_filename: str | None = None
-    source_crop_path: str | None = None
+    source_crop_path: str | None = None 
     source_crop_original_filename: str | None = None
     source_crop_svg_filename: str | None = None
     confidence: float | None = None
@@ -147,7 +147,10 @@ class DocumentInfo(BaseModel):
     answer_key_matched: int = 0
     question_classification: dict[str, int] = Field(default_factory=dict)
     math_extraction: dict[str, Any] = Field(default_factory=dict)
+    # Existing Ollama-based verification (keep for backward compatibility)
     vision_verification: dict[str, Any] = Field(default_factory=dict)
+    # New Groq page-level visual transcription results
+    groq_verification: dict[str, Any] = Field(default_factory=dict)
     extraction_summary: dict[str, Any] = Field(default_factory=dict)
 
 

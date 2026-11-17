@@ -1,0 +1,137 @@
+{
+    "pdf": "C:\\Users\\shiva\\Desktop\\docujson\\backend\\tests\\fixtures\\phase9\\physics_question.pdf",
+    "total_pages": 16,
+    "digital_text_pages": 14,
+    "limited_text_pages": 2,
+    "ocr_candidate_pages": 0,
+    "pages": [
+        {
+            "page": 1,
+            "type": "digital_text",
+            "text_characters": 3446,
+            "embedded_images": 5,
+            "vector_drawings": 31,
+            "text_preview": "\nDo not open this Test Booklet until you are asked to do so\nForm Number :\nYour Target is to secure Good Rank in Pre-Medical 2024\nImportant Instructions\nTest Type : SRG\n   Test Pattern : NEET(UG)"
+        },
+        {
+            "page": 2,
+            "type": "limited_text",
+            "text_characters": 40,
+            "embedded_images": 0,
+            "vector_drawings": 0,
+            "text_preview": "Join Telegram: @NEETxNOAH\nTG: @NEETxNOAH"
+        },
+        {
+            "page": 3,
+            "type": "digital_text",
+            "text_characters": 1472,
+            "embedded_images": 2,
+            "vector_drawings": 52,
+            "text_preview": "SECTION - A  (PHYSICS)\n1.\n2.\n3.\n4.\n5.\n1\nHindi + English\nTopic : Basic Mathematics used in physics, Vector and Kinematics\nअनुभाग - A  (भौतिकी)\n1.\n2.\n3.\n4.\n5.\nWhich is correct :-\n(1) sin 300° = 1/2 \n(2) tan (180° + θ) = – tanθ\n(3) cos (270° – θ) = – si"
+        },
+        {
+            "page": 4,
+            "type": "digital_text",
+            "text_characters": 2007,
+            "embedded_images": 2,
+            "vector_drawings": 32,
+            "text_preview": "6.\n7.\n8.\n9.\n10.\nHindi + English\n2\n6.\n7.\n8.\n9.\n10.\nThe value of x on solving this quadratic equation\n2x – 7x + 5 = 0 are :-\n(1)\n and 1\n(2)\n and 1 \n(3)  \n and 1\n(4)\n and – 1\n2\n5\n2\n3\n2\n−5\n2\n5\n2\nद्विघात समीकरण 2x – 7x + 5 = 0 को हल करने पर x के\nप्रााप्त "
+        },
+        {
+            "page": 5,
+            "type": "digital_text",
+            "text_characters": 2569,
+            "embedded_images": 1,
+            "vector_drawings": 68,
+            "text_preview": "11.\n12.\n13.\n14.\n15.\n16.\n3\nHindi + English\n11.\n12.\n13.\n14.\n15.\n16.\nA vector makes 45° and 60° angle with x and y\naxis respectively then unit vector along this  is :\n(1)\n(2)\n(3)\n(4)\ni +\nj\n1\n√2\nˆ\n1\n2\nˆ\ni +\nj +\nk\n1\n√2\nˆ\n1\n2\nˆ\n1\n2\nˆ\ni +\nj +\nk\n1\n√2\nˆ\n1\n2\nˆ"
+        },
+        {
+            "page": 6,
+            "type": "digital_text",
+            "text_characters": 2463,
+            "embedded_images": 6,
+            "vector_drawings": 58,
+            "text_preview": "17.\n18.\n19.\n20.\nHindi + English\n4\n17.\n18.\n19.\n20.\nThree coplanar vectors \n and \n  have\nmagnitudes 4, 3 and 2 respectively. If the angle\nbetween any two vectors is 120° then which of the\nfollowing vector may be equal to \n(1)\n(2)\n(3)\n(4)\n→A, →B\n→C\n+\n+\n"
+        },
+        {
+            "page": 7,
+            "type": "digital_text",
+            "text_characters": 2052,
+            "embedded_images": 8,
+            "vector_drawings": 16,
+            "text_preview": "21.\n22.\n23.\n24.\n25.\n5\nHindi + English\n21.\n22.\n23.\n24.\n25.\nFigure shows the path followed by a particle. Its\nvelocity is shown at points A and B. Which of the\nvector in the given options best represents the average\nacceleration of the particle for its"
+        },
+        {
+            "page": 8,
+            "type": "digital_text",
+            "text_characters": 2412,
+            "embedded_images": 4,
+            "vector_drawings": 22,
+            "text_preview": "26.\n27.\n28.\n29.\n30.\nHindi + English\n6\n26.\n27.\n28.\n29.\n30.\nIn the locus diagrams of two projectile 1 and 2 as\nshown in the figure :-\n(1) T = T and \n(2) T < T and  \n(3) T > T and \n(4) T = T   and \n1\n2\nV01 > V02\n1\n2\nV01 < V02\n1\n2\nV01 > V02\n1\n2\nV01 < V02"
+        },
+        {
+            "page": 9,
+            "type": "digital_text",
+            "text_characters": 2620,
+            "embedded_images": 3,
+            "vector_drawings": 22,
+            "text_preview": "31.\n32.\n33.\n34.\n35.\n7\nHindi + English\n31.\n32.\n33.\n34.\n35.\nWater drops fall at regular intervals from a tap\nwhich is 5m above the ground. The third drop is\nleaving the tap at the instant the first drop\ntouches the ground. How far above the ground is\nt"
+        },
+        {
+            "page": 10,
+            "type": "digital_text",
+            "text_characters": 1477,
+            "embedded_images": 4,
+            "vector_drawings": 40,
+            "text_preview": "SECTION - B  (PHYSICS)\n36.\n37.\n38.\nHindi + English\n8\nअनुभाग - B  (भौतिकी)\n36.\n37.\n38.\nGraph of y = 9sin(3πx) is as shown the\nnumerical value of A(B+C) is :\n(1) 5\n(2) 3\n(3) 9\n(4) 6\nयदि y = 9sin(3πx) का ग्रााफ निम्न है तब A(B+C) का\nसंख्यात्मक मान होगा "
+        },
+        {
+            "page": 11,
+            "type": "digital_text",
+            "text_characters": 2145,
+            "embedded_images": 1,
+            "vector_drawings": 110,
+            "text_preview": "39.\n40.\n41.\n9\nHindi + English\n39.\n40.\n41.\nIf vectors \n  and\n are coplanar, the value of y is :-\n(1) 81\n(2) 36\n(3) 23\n(4) 9\n(2i + 2j −2k), (5i + yj + k)\n^\n^\n^\n^\n^\n^\n(−i + 2j + 2k)\n^\n^\n^\nयदि \nसदिश \n \nऔर\n समतलीय हो तो y का मान होगा-\n(1) 81\n(2) 36\n(3) 23"
+        },
+        {
+            "page": 12,
+            "type": "digital_text",
+            "text_characters": 2598,
+            "embedded_images": 2,
+            "vector_drawings": 30,
+            "text_preview": "42.\n43.\n44.\n45.\n46.\nHindi + English\n10\n42.\n43.\n44.\n45.\n46.\nA balloonist releases a bag from a balloon rising\nconstantly at 40 ms at a time when the balloon\nis 100 m above the ground. If g = 10 ms , then\nthe bag reaches the ground in :-\n(1) 16 s\n(2) 1"
+        },
+        {
+            "page": 13,
+            "type": "digital_text",
+            "text_characters": 2101,
+            "embedded_images": 3,
+            "vector_drawings": 42,
+            "text_preview": "47.\n48.\n49.\n50.\n11\nHindi + English\n47.\n48.\n49.\n50.\nA body initially at rest, starts moving along x-axis\nin such a way so that its acceleration v/s\ndisplacement plot is given below. The maximum\nvelocity of the particle is :-\n(1) 1 m/s (2) 6 m/s (3) 2 "
+        },
+        {
+            "page": 14,
+            "type": "digital_text",
+            "text_characters": 184,
+            "embedded_images": 1,
+            "vector_drawings": 10,
+            "text_preview": "Hindi + English\n12\nSPACE FOR ROUGH WORK / रफ कार्य के लिए जगह\n03-08-2023\n1016CMD303031230018\nPHASE - MLA,B,H,J,K,M,P,Q,T & MAZA, B,F,K,R & MAZX\nJoin Telegram: @NEETxNOAH\nTG: @NEETxNOAH"
+        },
+        {
+            "page": 15,
+            "type": "limited_text",
+            "text_characters": 40,
+            "embedded_images": 0,
+            "vector_drawings": 0,
+            "text_preview": "Join Telegram: @NEETxNOAH\nTG: @NEETxNOAH"
+        },
+        {
+            "page": 16,
+            "type": "digital_text",
+            "text_characters": 1812,
+            "embedded_images": 0,
+            "vector_drawings": 4,
+            "text_preview": "LEADER & ACHIEVER  COURSE SRG : PHASE - MLA,B,H,J,K,M,P,Q,T & MAZA, B,F,K,R & MAZX\n1016CMD303031230018\nRead carefully the following instructions :\n1. Each candidate must show on demand his/her\nAllen ID Card to the Invigilator.\n2. No candidate, withou"
+        }
+    ]
+}

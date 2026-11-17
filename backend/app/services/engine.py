@@ -23,7 +23,8 @@ from app.storage import update_job
 from app.services.answer_key import parse_answer_key
 from app.services.svg_render import attach_raster_svg_wrappers, reconstruct_pdf_vector_svg
 from app.services.math_pipeline import attach_math_evidence, page_math_segments, validate_segmentation
-from app.services.vision import verify_math_image
+from app.services.groq_vision import verify_pages_with_groq
+from app.services.layout import detect_page_layout
 
 logger = logging.getLogger("docujson")
 
@@ -682,10 +683,11 @@ def _line_text_from_spans(spans: list[dict]) -> str:
     return re.sub(r"([A-Za-z0-9])\s+([\u2070-\u209f\u1d2c-\u1d7f])", r"\1\2", "".join(pieces).strip())
 
 
-def _ordered_layout_lines(lines, page_width: float):
-    """Order full-width separators and independent columns without a page-wide y sort."""
-    if not lines:
-        return [], None
+def _ordered_layout_lines(
+    lines,
+    page_width: float,
+    page_height: float | None = None,
+):
 
     def order_rows(items):
         # PyMuPDF can place prose and inline math on the same visual row in
@@ -767,38 +769,86 @@ def _ordered_layout_lines(lines, page_width: float):
                     ordered.append(replacements.get(index, fragment))
         return ordered
 
-    full, left, right = [], [], []
-    for item in lines:
-        rect = item[3]
-        if rect.width >= page_width * 0.68 or (rect.x0 < page_width * 0.12 and rect.x1 > page_width * 0.88):
-            full.append(item)
-        elif (rect.x0 + rect.x1) / 2 < page_width / 2:
-            left.append(item)
-        else:
-            right.append(item)
-    full = order_rows(full)
-    left = order_rows(left)
-    right = order_rows(right)
-    if not left or not right:
-        ordered = order_rows(lines)
-        return ordered, None
 
-    # A full-width heading/paragraph separates reading-order bands. Within each
-    # band, read down the left column and then down the right column.
-    ordered = []
-    previous_y = float("-inf")
-    for separator in full:
-        separator_y = separator[3].y0
-        ordered.extend(item for item in left if previous_y < item[3].y0 < separator_y)
-        ordered.extend(item for item in right if previous_y < item[3].y0 < separator_y)
-        ordered.append(separator)
-        previous_y = separator_y
-    ordered.extend(item for item in left if item[3].y0 > previous_y)
-    ordered.extend(item for item in right if item[3].y0 > previous_y)
-    bounds = {
-        "left": [min(item[3].x0 for item in left), max(item[3].x1 for item in left)],
-        "right": [min(item[3].x0 for item in right), max(item[3].x1 for item in right)],
+    if not lines:
+        return [], None
+
+    if page_height is None:
+        page_height = max(
+            item[3].y1 for item in lines
+        )
+    
+
+    layout = detect_page_layout(
+        lines,
+        page_width,
+        page_height,
+    )
+
+    regions = layout.get("regions", [])
+    columns = layout.get("columns", [])
+
+    if not regions:
+        return order_rows(lines), None
+
+    indexed_lines = {
+        index: item
+        for index, item in enumerate(lines)
     }
+
+    ordered = []
+    assigned_indices = set()
+
+    for region in sorted(
+        regions,
+        key=lambda item: item.get("reading_order", 0),
+    ):
+        region_indices = region.get("line_indices", [])
+
+        region_lines = [
+            indexed_lines[index]
+            for index in region_indices
+            if index in indexed_lines
+        ]
+
+        if not region_lines:
+            continue
+
+        ordered.extend(order_rows(region_lines))
+        assigned_indices.update(
+            index
+            for index in region_indices
+            if index in indexed_lines
+        )
+
+    unassigned = [
+        item
+        for index, item in enumerate(lines)
+        if index not in assigned_indices
+    ]
+
+    if unassigned:
+        ordered.extend(order_rows(unassigned))
+
+    bounds = None
+
+    if len(columns) == 2:
+        sorted_columns = sorted(
+            columns,
+            key=lambda column: column["bbox"][0],
+        )
+
+        bounds = {
+            "left": [
+                sorted_columns[0]["bbox"][0],
+                sorted_columns[0]["bbox"][2],
+            ],
+            "right": [
+                sorted_columns[1]["bbox"][0],
+                sorted_columns[1]["bbox"][2],
+            ],
+        }
+
     return ordered, bounds
 
 
@@ -1330,7 +1380,13 @@ def extract_pdf(path: Path, media_dir: Path):
                     )
 
             page_width = page.rect.width
-            ordered_lines, column_bounds = _ordered_layout_lines(text_lines, page_width)
+            page_height = page.rect.height
+
+            ordered_lines, column_bounds = _ordered_layout_lines(
+                text_lines,
+                page_width,
+                page_height,
+            )
             native_ordered_lines = list(ordered_lines)
             column_texts = None
             if column_bounds:
@@ -1389,12 +1445,33 @@ def extract_pdf(path: Path, media_dir: Path):
                 )
 
                 if should_replace_with_ocr:
-                    ordered_lines, column_bounds = _ordered_layout_lines(ocr_lines, page_width)
+                    ordered_lines, column_bounds = _ordered_layout_lines(
+                        ocr_lines,
+                        page_width,
+                        page_height,
+                    )
                     column_texts = None
+
                     if column_bounds:
                         column_texts = [
-                            [item[2] for item in ocr_lines if (item[3].x0 + item[3].x1) / 2 < page_width / 2 and item[3].width < page_width * 0.68],
-                            [item[2] for item in ocr_lines if (item[3].x0 + item[3].x1) / 2 >= page_width / 2 and item[3].width < page_width * 0.68],
+                            [
+                                item[2]
+                                for item in text_lines
+                                if (
+                                    column_bounds["left"][0]
+                                    <= (item[3].x0 + item[3].x1) / 2
+                                    <= column_bounds["left"][1]
+                                )
+                            ],
+                            [
+                                item[2]
+                                for item in text_lines
+                                if (
+                                    column_bounds["right"][0]
+                                    <= (item[3].x0 + item[3].x1) / 2
+                                    <= column_bounds["right"][1]
+                                )
+                            ],
                         ]
                     page_text = "\n".join(item[2] for item in ordered_lines)
                     ocr_used = bool(page_text)
@@ -3241,92 +3318,51 @@ def attach_media(sections, media, pages, source_document=None, media_dir=None):
             question["review_required"] = True
 
 
-def verify_suspicious_option_crops(sections, media_dir: Path) -> dict:
-    """Attach untrusted Ollama transcripts as review evidence; never replace source text."""
-    summary = {
-        "enabled": bool(settings.ollama_enabled),
-        "available": False,
-        "model": settings.ollama_model if settings.ollama_enabled else None,
-        "used": False,
-        "regions_attempted": 0,
-        "regions_completed": 0,
-        "warnings": [],
-    }
-    if not settings.ollama_enabled:
-        return summary
+def get_groq_review_pages(sections) -> list[int]:
+    """Return source pages containing questions or options needing review."""
 
-    import httpx
-
-    try:
-        response = httpx.get(
-            f"{settings.ollama_base_url.rstrip('/')}/api/tags",
-            timeout=min(8.0, settings.ollama_timeout_seconds),
-        )
-        response.raise_for_status()
-        model_names = {item.get("name") for item in response.json().get("models", [])}
-        summary["available"] = settings.ollama_model in model_names
-        if not summary["available"]:
-            summary["warnings"].append(f"Configured Ollama model {settings.ollama_model!r} is unavailable; visual verification was skipped.")
-            return summary
-    except Exception as error:
-        summary["warnings"].append(f"Ollama is enabled but unavailable: {type(error).__name__}: {error}")
-        return summary
+    pages = set()
 
     for section in sections:
-        for question in section["questions"]:
-            for option in question.get("options", []):
-                crops = [asset for asset in option.get("media", []) if asset.get("type") == "option_crop"]
-                if not crops:
-                    continue
-                crop = crops[0]
-                image_path = media_dir / crop["filename"]
-                if not image_path.is_file():
-                    summary["warnings"].append(f"Source crop for Q{question['question_number']} option {option['id']} is missing; visual verification skipped.")
-                    continue
-                summary["regions_attempted"] += 1
-                try:
-                    candidate = verify_math_image(
-                        image_path,
-                        base_url=settings.ollama_base_url,
-                        model=settings.ollama_model,
-                        timeout_seconds=settings.ollama_timeout_seconds,
-                    )
-                    summary["used"] = True
-                    summary["regions_completed"] += 1
-                    native = re.sub(r"\s+", "", option.get("text", "")).casefold()
-                    visual = re.sub(r"\s+", "", candidate["candidate_transcription"]).casefold()
-                    matches = bool(native) and native in visual or bool(visual) and visual in native
-                    option["vision_verification"] = {
-                        **candidate,
-                        "candidate_matches_extracted_text": matches,
-                        "accepted_as_reconstruction": False,
-                    }
-                    option.setdefault("math_evidence", []).append({
-                        "original_text": option.get("original_text") or option.get("text", ""),
-                        "reconstructed_text": None,
-                        "normalized_text": None,
-                        "latex": None,
-                        "mathml": None,
-                        "source_page": crop.get("source_page"),
-                        "source_bbox": crop.get("bbox"),
-                        "component_bboxes": [crop.get("bbox")] if crop.get("bbox") else [],
-                        "extraction_method": "ollama_qwen_visual_candidate",
-                        "confidence": None,
-                        "review_required": True,
-                        "review_reasons": ["Vision transcription is an unaccepted candidate; compare it with the original PDF crop."],
-                        "vision_candidate": candidate["candidate_transcription"],
-                    })
-                    if not matches:
-                        reason = "Local vision transcription differs from extracted option text; manual source review is required."
-                        option["review_required"] = True
-                        option["review_reasons"] = list(dict.fromkeys(option.get("review_reasons", []) + [reason]))
-                        question["review_required"] = True
-                        question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [f"Option {option['id']}: {reason}"]))
-                except Exception as error:
-                    summary["warnings"].append(f"Visual verification failed for Q{question['question_number']} option {option['id']}: {type(error).__name__}: {error}")
-    if summary["regions_attempted"] > summary["regions_completed"]:
-        summary["warnings"].append(f"Visual verification completed for {summary['regions_completed']} of {summary['regions_attempted']} suspicious option crops.")
-    return summary
+        for question in section.get("questions", []):
+
+            question_needs_review = bool(
+                question.get("review_required")
+            )
+
+            option_needs_review = any(
+                option.get("review_required")
+                for option in question.get("options", [])
+            )
+
+            math_needs_review = any(
+                evidence.get("review_required")
+                for evidence in question.get("math_evidence", [])
+            )
+
+            math_needs_review = math_needs_review or any(
+                evidence.get("review_required")
+                for option in question.get("options", [])
+                for evidence in option.get("math_evidence", [])
+            )
+
+            if not (
+                question_needs_review
+                or option_needs_review
+                or math_needs_review
+            ):
+                continue
+
+            source = question.get("source", {})
+
+            if source.get("page"):
+                pages.add(int(source["page"]))
+
+            for region in source.get("regions", []):
+                if region.get("page"):
+                    pages.add(int(region["page"]))
+
+    return sorted(pages)
 
 
 def run_conversion(
@@ -3436,6 +3472,14 @@ def run_conversion(
                 root / "media",
             )
             segmentation_issues = validate_segmentation(sections)
+
+            groq_review_pages = get_groq_review_pages(sections)
+
+            groq_verification = verify_pages_with_groq(
+                source_document=source_document,
+                page_numbers=groq_review_pages,
+            )
+
             if segmentation_issues:
                 extraction_issue_summary = Counter(issue["code"] for issue in segmentation_issues)
                 math_extraction["segmentation_issues"] = segmentation_issues
@@ -3449,11 +3493,9 @@ def run_conversion(
                         for question in section.get("questions", []):
                             if question.get("question_id") in affected:
                                 question["review_required"] = True
-                                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [issue["message"]]))
-        wrapped_sources = attach_raster_svg_wrappers(sections, root / "media")
-        if wrapped_sources:
-            logger.info("Created %d raster SVG wrappers for conversion %s", len(wrapped_sources), conversion_id)
-        vision_verification = verify_suspicious_option_crops(sections, root / "media")
+                                question["review_reasons"] = list(dict.fromkeys(question.get("review_reasons", []) + [issue["message"]]))            
+
+        
         for section in sections:
             for parsed_question in section["questions"]:
                 # Keep source coordinates in output for audit/debugging.
@@ -3731,7 +3773,7 @@ def run_conversion(
 
         extraction_warnings = list(answer_parse["warnings"])
         extraction_warnings.extend(math_extraction["warnings"])
-        extraction_warnings.extend(vision_verification["warnings"])
+        extraction_warnings.extend(groq_verification["warnings"])
         for page in document_data["pages"]:
             extraction_warnings.extend(page.get("ocr_warnings", []))
         if missing_answers:
@@ -3768,7 +3810,7 @@ def run_conversion(
                     "unassigned_fragments": math_extraction["unassigned_fragments"],
                     "segmentation_issues": math_extraction.get("segmentation_issues", []),
                 },
-                "vision_verification": vision_verification,
+                "groq_verification": groq_verification,
                 "extraction_summary": {
                     "confirmed_mcq": classification["confirmed_mcq"],
                     "unresolved": classification["unresolved"],
